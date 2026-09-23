@@ -1,10 +1,10 @@
 # PaxxMaker-Connect
 
-> Latest release: [v1.3](https://github.com/DanielR1c/PaxxMaker-Connect/releases/tag/v1.3) (2026-09-23)
-> Includes the macOS DMG and Windows ZIP builds.
-
+[![Latest release](https://img.shields.io/github/v/release/DanielR1c/PaxxMaker-Connect?label=Latest%20Release)](https://github.com/DanielR1c/PaxxMaker-Connect/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-macOS%2013%2B%20%7C%20Windows%2010%2B-blue)](#requirements)
 [![Status](https://img.shields.io/badge/Status-Beta-yellow)](#project-status)
+
+> Latest release: [v1.3](https://github.com/DanielR1c/PaxxMaker-Connect/releases/tag/v1.3) — 2026-09-23
 
 PaxxMaker-Connect is a small macOS and Windows helper application that connects the iPhone/iPad app **PaxxMaker** with a locally installed **OrcaSlicer** instance.
 
