@@ -9,7 +9,7 @@ PaxxMaker-Connect is a small macOS and Windows helper application that connects 
 
 The model is positioned, rotated, scaled and painted on the mobile device. PaxxMaker-Connect runs OrcaSlicer headlessly in the background and sends the generated G-code back to the app, which can then send it directly to the printer.
 
-> **No cloud, no account, no telemetry.** Communication stays entirely on the local network. The pairing code is stored only on the computer.
+> **No cloud, no account.** Communication stays entirely on the local network. The pairing code is stored only on the computer.
 
 PaxxMaker-Connect does not modify OrcaSlicer. It only reads its profiles and uses its command-line interface.
 
@@ -99,12 +99,6 @@ The Windows build runs in the system tray. Its local pairing page is available a
 
 The current builds are not signed or notarized, so the one-time Gatekeeper or SmartScreen confirmation is required on first launch.
 
-### Roadmap
-
-- Notarization and signing for macOS and Windows
-- Linux build
-- Multiple plates per job
-- More granular profile selection
 
 ### Contributing
 
