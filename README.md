@@ -1,6 +1,6 @@
 # PaxxMaker-Connect
 
-[![Latest release](https://img.shields.io/github/v/release/DanielR1c/PaxxMaker-Connect?label=Latest%20Release)](https://github.com/DanielR1c/PaxxMaker-Connect/releases/latest)
+[![Latest release](https://github.com/DanielR1c/PaxxMaker-Connect/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-macOS%2013%2B%20%7C%20Windows%2010%2B-blue)](#requirements)
 [![Status](https://img.shields.io/badge/Status-Beta-yellow)](#project-status)
 
