@@ -19,7 +19,6 @@ A running Mac or Windows PC running OrcaSlicer is required on the same network.
 - Local service on port `8765`
 - Network discovery via Bonjour/mDNS (`_paxxconnect._tcp`)
 - Pairing with a six-digit code or QR code
-- Token authentication using the `X-Paxx-Token` header
 - Pairing code persists across restarts
 - Reads printer, process and filament profiles from OrcaSlicer
 - Reads Snapmaker Orca profiles when installed
@@ -59,7 +58,7 @@ For multi-toolhead prints, four filament profiles are supplied in toolhead order
 
 #### macOS
 
-1. Open the release DMG: `PaxxMaker-Connect.dmg`.
+1. Open the release DMG: `PaxxMaker-Connect-....dmg`.
 2. Drag the app to `Applications` and launch it manually.
 3. On the first launch, allow the app under **System Settings → Privacy & Security → Open Anyway** because the app is not notarized.
 4. Allow incoming connections and local network access when macOS asks.
@@ -68,12 +67,12 @@ The macOS build runs as a menu bar app with a cube icon. Double-clicking the app
 
 #### Windows
 
-1. Extract `PaxxMaker-Connect-Windows.zip` completely. Do not run the app from inside the ZIP.
-2. Double-click `PaxxMaker-Connect Install.cmd`.
-3. The app is copied to `%LocalAppData%\\Programs\\PaxxMaker-Connect` and a Start Menu entry is created.
-4. Optionally enable the firewall rule and autostart.
-5. On the first launch, confirm the SmartScreen prompt with **More info → Run anyway** because the file is not signed.
-6. Allow access for private networks when Windows Firewall asks.
+1. Extract `PaxxMaker-Connect-....zip` completely. Do not run the app from inside the ZIP.
+5. Double-click `PaxxMaker-Connect Install.cmd`.
+6. The app is copied to `%LocalAppData%\\Programs\\PaxxMaker-Connect` and a Start Menu entry is created.
+7. Optionally enable the firewall rule and autostart.
+8. On the first launch, confirm the SmartScreen prompt with **More info → Run anyway** because the file is not signed.
+9. Allow access for private networks when Windows Firewall asks.
 
 To uninstall, run `PaxxMaker-Connect Deinstall.cmd`.
 
