@@ -1,7 +1,6 @@
 # PaxxMaker-Connect
 
 [![Platform](https://img.shields.io/badge/Platform-macOS%2013%2B%20%7C%20Windows%2010%2B-blue)](#requirements)
-[![Languages](https://img.shields.io/badge/Languages-Swift%20%7C%20Go-orange)](#technologies)
 [![Status](https://img.shields.io/badge/Status-Beta-yellow)](#project-status)
 
 
@@ -13,7 +12,7 @@ The model is positioned, rotated, scaled and painted on the mobile device. PaxxM
 
 PaxxMaker-Connect does not modify OrcaSlicer. It only reads its profiles and uses its command-line interface.
 
-A Mac or Windows PC running OrcaSlicer is required on the same network.
+A running Mac or Windows PC running OrcaSlicer is required on the same network.
 
 ### Features
 
@@ -25,7 +24,6 @@ A Mac or Windows PC running OrcaSlicer is required on the same network.
 - Reads printer, process and filament profiles from OrcaSlicer
 - Reads Snapmaker Orca profiles when installed
 - Resolves `inherits` chains into complete JSON profiles
-- Accepts 3MF jobs with per-object transforms, toolhead assignments, settings and painted faces
 - Runs OrcaSlicer headlessly
 - Reports staged progress and provides print time, weight, cost, layer count and height
 - Reads the effective support settings from the G-code footer
@@ -34,8 +32,6 @@ A Mac or Windows PC running OrcaSlicer is required on the same network.
 - Automatically removes jobs older than one day
 
 #### Snapmaker U1 support
-
-For a single-toolhead print, the plate is sliced for `T0` and the resulting G-code is rewritten for the selected toolhead.
 
 For multi-toolhead prints, four filament profiles are supplied in toolhead order. OrcaSlicer handles tool changes and the purge tower. The tower position is provided by the app; if no position is specified, Connect searches for the first free corner.
 
@@ -64,12 +60,9 @@ For multi-toolhead prints, four filament profiles are supplied in toolhead order
 #### macOS
 
 1. Open the release DMG: `PaxxMaker-Connect.dmg`.
-2. Double-click `PaxxMaker-Connect Install.command`. The script copies the app to Applications, checks OrcaSlicer, asks about autostart and launches the app.
-3. Alternatively, drag the app to `Applications` and launch it manually.
-4. On the first launch, allow the app under **System Settings → Privacy & Security → Open Anyway** because the app is not notarized.
-5. Allow incoming connections and local network access when macOS asks.
-
-To uninstall, run `PaxxMaker-Connect Deinstall.command`.
+2. Drag the app to `Applications` and launch it manually.
+3. On the first launch, allow the app under **System Settings → Privacy & Security → Open Anyway** because the app is not notarized.
+4. Allow incoming connections and local network access when macOS asks.
 
 The macOS build runs as a menu bar app with a cube icon. Double-clicking the app opens the pairing window again. Autostart is managed through `SMAppService`.
 
