@@ -8,6 +8,7 @@ package main
 // (Same logic as Profiles.swift of the Mac version.)
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"os"
@@ -145,12 +146,23 @@ func (idx *ProfileIndex) scan() {
 // Orca's own config: which system filaments were ticked, which printers used.
 func (idx *ProfileIndex) appConfig() (filaments map[string]bool, machines map[string]bool) {
 	filaments, machines = map[string]bool{}, map[string]bool{}
-	b, err := os.ReadFile(filepath.Join(idx.App.DataDir, idx.App.ConfName))
+	path := filepath.Join(idx.App.DataDir, idx.App.ConfName)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
+	// Orca appends a "# MD5 checksum …" line after the closing brace, which
+	// makes the file invalid JSON. Cut it off before parsing — otherwise the
+	// config never parses and both filters below stay empty, so the app offers
+	// every bundled printer and filament instead of the ones actually in use.
+	if i := bytes.LastIndexByte(b, '}'); i >= 0 {
+		b = b[:i+1]
+	}
 	var conf JSONObject
-	if json.Unmarshal(b, &conf) != nil {
+	if err := json.Unmarshal(b, &conf); err != nil {
+		if state != nil {
+			state.Log.Add(L("Orca-Konfiguration nicht lesbar: ", "Cannot read Orca config: ") + err.Error())
+		}
 		return
 	}
 	for _, f := range toStringSlice(conf["filaments"]) {
