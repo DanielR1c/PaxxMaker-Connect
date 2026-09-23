@@ -1,0 +1,55 @@
+PaxxMaker-Connect – Installation (Deutsch)        English version below
+===========================================
+
+Einfachster Weg: Doppelklick auf „PaxxMaker-Connect Install.command“.
+Das Skript kopiert die App in den Programme-Ordner, gibt sie frei, prüft
+OrcaSlicer, fragt nach dem Autostart und startet die App.
+
+Blockt macOS die Datei („kann nicht geöffnet werden, da sie von einem nicht
+verifizierten Entwickler stammt“): Systemeinstellungen › Datenschutz &
+Sicherheit › ganz unten „Trotzdem öffnen“ – das ist nur einmal nötig.
+
+Von Hand geht es auch: „PaxxMaker-Connect“ auf „Applications“ ziehen und aus
+dem Programme-Ordner starten (dann kommt die Gatekeeper-Frage bei der App).
+
+Danach:
+• Es öffnet sich ein Fenster mit Kopplungscode und QR-Code. Die App lebt als
+  Würfel-Symbol oben in der Menüleiste; Doppelklick auf die App holt das
+  Fenster wieder.
+• Fragen von macOS („eingehende Verbindungen“, „lokales Netzwerk“) mit
+  „Erlauben“ beantworten – sonst findet das iPhone den Mac nicht.
+• OrcaSlicer muss installiert sein (Programme-Ordner):
+  https://github.com/OrcaSlicer/OrcaSlicer/releases
+• Auf dem iPhone/iPad in PaxxMaker: Slicer › „Per QR-Code verbinden“ und den
+  QR-Code scannen – oder „Manuell verbinden“ und den 6-stelligen Code eintippen.
+  Mac und iPhone müssen im selben WLAN sein.
+
+Entfernen: Doppelklick auf „PaxxMaker-Connect Deinstall.command“.
+
+
+PaxxMaker-Connect – Installation (English)
+==========================================
+
+Easiest way: double-click "PaxxMaker-Connect Install.command".
+The script copies the app to the Applications folder, clears the Gatekeeper
+block, checks for OrcaSlicer, asks about start at login and launches the app.
+
+If macOS blocks the file ("cannot be opened because it is from an unidentified
+developer"): System Settings › Privacy & Security › at the bottom "Open Anyway"
+– needed only once.
+
+Manual way: drag "PaxxMaker-Connect" onto "Applications" and start it from the
+Applications folder (the Gatekeeper question then comes for the app).
+
+Afterwards:
+• A window opens with the pairing code and QR code. The app lives as a cube
+  icon in the menu bar; double-clicking the app brings the window back.
+• Answer macOS prompts ("incoming connections", "local network") with
+  "Allow" – otherwise the iPhone cannot find the Mac.
+• OrcaSlicer has to be installed (Applications folder):
+  https://github.com/OrcaSlicer/OrcaSlicer/releases
+• On the iPhone/iPad in PaxxMaker: Slicer › "Connect with QR code" and scan
+  the QR code – or "Connect manually" and type the 6-character code.
+  Mac and iPhone must be on the same Wi-Fi.
+
+Remove: double-click "PaxxMaker-Connect Deinstall.command".
