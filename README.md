@@ -1,12 +1,14 @@
 # PaxxMaker-Connect
 
+> Latest release: [v1.3](https://github.com/DanielR1c/PaxxMaker-Connect/releases/tag/v1.3) (2026-09-23)
+> Includes the macOS DMG and Windows ZIP builds.
+
 [![Platform](https://img.shields.io/badge/Platform-macOS%2013%2B%20%7C%20Windows%2010%2B-blue)](#requirements)
 [![Status](https://img.shields.io/badge/Status-Beta-yellow)](#project-status)
 
-
 PaxxMaker-Connect is a small macOS and Windows helper application that connects the iPhone/iPad app **PaxxMaker** with a locally installed **OrcaSlicer** instance.
 
-The model is positioned, rotated, scaled and painted on the mobile device. PaxxMaker-Connect runs OrcaSlicer headlessly in the background and sends the generated G-code back to the app, which can then send it directly to the printer.
+The model is positioned, rotated, scaled and painted on the mobile device. PaxxMaker-Connect runs OrcaSlicer headlessly in the background and sends the generated G-code back to the app, which can then pass it on to the printer. Everything stays on the local network.
 
 > **No cloud, no account.** Communication stays entirely on the local network. The pairing code is stored only on the computer.
 
@@ -32,8 +34,7 @@ A running Mac or Windows PC running OrcaSlicer is required on the same network.
 
 #### Snapmaker U1 support
 
-For multi-toolhead prints, four filament profiles are supplied in toolhead order. OrcaSlicer handles tool changes and the purge tower. The tower position is provided by the app; if no position is specified, Connect searches for the first free corner.
-
+For multi-toolhead prints, four filament profiles are supplied in toolhead order. OrcaSlicer handles tool changes and the purge tower. The tower position is provided by the app; if no position is provided, the default is used.
 
 ### Requirements
 
@@ -84,13 +85,11 @@ The Windows build runs in the system tray. Its local pairing page is available a
 2. Alternatively, choose **Connect manually**, select the Mac/PC from the network list or enter its IP address.
 3. Enter the six-digit pairing code.
 
-
 ### Project status
 
 **Beta.** PaxxMaker-Connect is used daily with a Snapmaker U1 and a Creality Ender 3 S1.
 
 The current builds are not signed or notarized, so the one-time Gatekeeper or SmartScreen confirmation is required on first launch.
-
 
 ### Contributing
 
@@ -102,7 +101,5 @@ Bug reports and improvements are welcome. Please include the following in an iss
 - Printer model
 - Error message shown by the app
 - For slicing errors, the `Orca Exit` number if available
-
-
 
 PaxxMaker and PaxxMaker-Connect are independent hobby projects and are not affiliated with Snapmaker or the OrcaSlicer project. All mentioned trademarks belong to their respective owners.
