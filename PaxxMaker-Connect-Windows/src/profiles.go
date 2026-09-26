@@ -21,19 +21,20 @@ import (
 type JSONObject = map[string]any
 
 type OrcaApp struct {
-	Key      string // "snapmaker_orca" / "orca"
+	Key      string // "orca"
 	DataDir  string
 	ConfName string
 }
 
 var profileKinds = []string{"machine", "process", "filament"}
 
-// The two Orca flavours that can be installed side by side; only their
-// profile folders are read, slicing always uses OrcaSlicer's own binary.
+// Only OrcaSlicer. Reading Snapmaker Orca's folder as well split the presets
+// over two sources: a Snapmaker printer pulled its profiles from there, so the
+// filaments saved in OrcaSlicer were missing. OrcaSlicer ships the Snapmaker
+// profiles too, so one source is enough.
 func allOrcaApps() []OrcaApp {
 	base := orcaDataBase()
 	return []OrcaApp{
-		{Key: "snapmaker_orca", DataDir: filepath.Join(base, "Snapmaker_Orca"), ConfName: "Snapmaker_Orca.conf"},
 		{Key: "orca", DataDir: filepath.Join(base, "OrcaSlicer"), ConfName: "OrcaSlicer.conf"},
 	}
 }
@@ -336,6 +337,50 @@ func (idx *ProfileIndex) Available() map[string][]Preset {
 		res[kind] = items
 	}
 	return res
+}
+
+// Per-extruder values collected from this printer's own system filaments.
+// Thin user presets often lack keys (ramming, cooling, filament_is_support …)
+// that Orca needs once several filaments are loaded at once — and no single
+// system preset carries them all, so the union of them is used.
+func (idx *ProfileIndex) ReferenceFilamentValues(machineNames map[string]bool) JSONObject {
+	out := JSONObject{}
+	var names []string
+	for name, e := range idx.byName["filament"] {
+		inst, _ := e.dict["instantiation"].(string)
+		if e.origin == "system" && strings.EqualFold(inst, "true") {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		hit := false
+		for _, c := range idx.effectiveCompatible("filament", name) {
+			if machineNames[c] {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		r, ok := idx.Resolve("filament", name)
+		if !ok {
+			continue
+		}
+		for k, v := range r.Dict {
+			if !strings.HasPrefix(k, "filament_") {
+				continue
+			}
+			if _, isList := v.([]any); !isList {
+				continue
+			}
+			if _, have := out[k]; !have {
+				out[k] = v
+			}
+		}
+	}
+	return out
 }
 
 // Bed and head count from a machine preset's printable_area.

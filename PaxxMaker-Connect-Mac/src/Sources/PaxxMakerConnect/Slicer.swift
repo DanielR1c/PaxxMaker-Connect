@@ -115,6 +115,35 @@ final class SliceRunner {
             }
             machine.dict["thumbnails"] = [String]()      // no OpenGL headless
             Self.harmonise(&filaments, colours: spec["filament_colours"] as? [String] ?? [])
+            // Several filaments at once: every per-extruder list has to have
+            // one entry per filament. A key missing from all of them keeps
+            // Orca's single default and the slice dies with
+            // "filament_is_support's count 1 not equal to filament_colour's
+            // size 4" (exit 251). So the gaps are filled from a system
+            // filament of this printer.
+            if filaments.count > 1 {
+                let ref = idx.referenceFilamentValues(for: Set(machineNames))
+                for (k, v) in ref where k != "filament_colour" && k != "compatible_printers" {
+                    for i in filaments.indices where filaments[i].dict[k] == nil { filaments[i].dict[k] = v }
+                }
+            }
+
+            // Temperatures the phone sends along: they replace the filament's
+            // own values. The bed temperature belongs to the plate type, so it
+            // is written to the keys of the plate this printer uses.
+            let bedType = (machine.dict["default_bed_type"] as? String) ?? "Textured PEI Plate"
+            let nozzles = (spec["nozzle_temps"] as? [Any])?.map { Int(($0 as? NSNumber)?.doubleValue ?? 0) } ?? []
+            for (i, t) in nozzles.enumerated() where t > 0 && i < filaments.count {
+                filaments[i].dict["nozzle_temperature"] = ["\(t)"]
+                filaments[i].dict["nozzle_temperature_initial_layer"] = ["\(t)"]
+            }
+            if let bed = (spec["bed_temp"] as? NSNumber)?.intValue, bed > 0 {
+                let key = Self.plateTempKey(bedType)
+                for i in filaments.indices {
+                    filaments[i].dict[key] = ["\(bed)"]
+                    filaments[i].dict[key + "_initial_layer"] = ["\(bed)"]
+                }
+            }
 
             func write(_ obj: JSONObject, _ name: String) throws -> URL {
                 let u = job.dir.appendingPathComponent(name)
@@ -154,13 +183,35 @@ final class SliceRunner {
             var filURLs: [URL] = []
             for (i, f) in filaments.enumerated() { filURLs.append(try write(f.dict, "filament_\(i).json")) }
 
+            // The bed type is a project setting in Orca's GUI; the CLI falls
+            // back to "Cool Plate", and most filaments have 0 °C for that —
+            // the printer then warns about a cold bed. So the printer's own
+            // default plate (see above) is passed explicitly.
             var args = [modelURL.path,
                         "--load-settings", "\(machineURL.path);\(processURL.path)",
                         "--load-filaments", filURLs.map(\.path).joined(separator: ";"),
                         "--arrange", "0", "--slice", "0",
-                        "--outputdir", job.dir.path, "--debug", "2", "--logfile", job.dir.appendingPathComponent("orca.log").path]
+                        "--outputdir", job.dir.path, "--debug", "2", "--logfile", job.dir.appendingPathComponent("orca.log").path,
+                        "--curr-bed-type=\(bedType)"]
+            let given = (spec["overrides"] as? JSONObject) ?? [:]
             for (key, fn) in Self.overrides {
-                if let v = (spec["overrides"] as? JSONObject)?[key], let a = fn(v) { args.append(a) }
+                if let v = given[key], let a = fn(v) { args.append(a) }
+            }
+            // Settings the app added on its own (its editor offers every key
+            // OrcaSlicer knows). The CLI takes any config key as an option, so
+            // these go through unchanged — only the key is checked, so nothing
+            // but a setting can end up in the argument list.
+            for (key, v) in given where Self.overrides[key] == nil {
+                guard key.range(of: "^[a-z][a-z0-9_]{1,60}$", options: .regularExpression) != nil else { continue }
+                let value: String
+                switch v {
+                case let b as Bool: value = b ? "1" : "0"
+                case let n as NSNumber: value = n.stringValue
+                case let s as String: value = s
+                default: continue
+                }
+                guard !value.isEmpty, !value.contains("\n") else { continue }
+                args.append("--" + key.replacingOccurrences(of: "_", with: "-") + "=" + value)
             }
             // One head: the plate is sliced for T0 and the G-code rewritten to
             // the chosen head afterwards (the U1 toolkit's route). Several
@@ -212,6 +263,17 @@ final class SliceRunner {
             job.state = "failed"; job.error = error.localizedDescription; job.stage = "failed"
             log("Job \(job.id) " + L("fehlgeschlagen", "failed") + ": \(error.localizedDescription)")
         }
+    }
+
+    /// Which filament key holds the bed temperature depends on the plate the
+    /// printer uses.
+    static func plateTempKey(_ bedType: String) -> String {
+        let t = bedType.lowercased()
+        if t.contains("textured") { return "textured_plate_temp" }
+        if t.contains("engineering") { return "eng_plate_temp" }
+        if t.contains("high temp") { return "hot_plate_temp" }
+        if t.contains("supertack") || t.contains("cool") { return "cool_plate_temp" }
+        return "hot_plate_temp"
     }
 
     /// Orca's CLI exit codes are negative (Utils.hpp); the shell shows them as

@@ -147,6 +147,9 @@ var overrides = []struct {
 	{"print_sequence", "print-sequence", ovStr},
 }
 
+// Keys the app may pass through untouched.
+var validOverrideKey = regexp.MustCompile(`^[a-z][a-z0-9_]{1,60}$`)
+
 func numOf(v any) (float64, bool) {
 	switch x := v.(type) {
 	case float64:
@@ -260,6 +263,55 @@ func (r *SliceRunner) run(job *SliceJob) error {
 	}
 	machine.Dict["thumbnails"] = []string{} // no OpenGL headless
 	harmonise(filaments, toStringSlice(spec["filament_colours"]))
+	// Several filaments at once: every per-extruder list has to have one entry
+	// per filament. A key missing from all of them keeps Orca's single default
+	// and the slice dies with "filament_is_support's count 1 not equal to
+	// filament_colour's size 4" (exit 251). So the gaps are filled from this
+	// printer's system filaments.
+	if len(filaments) > 1 {
+		names := map[string]bool{}
+		for _, n := range machineNames {
+			names[n] = true
+		}
+		for k, v := range idx.ReferenceFilamentValues(names) {
+			if k == "filament_colour" || k == "compatible_printers" {
+				continue
+			}
+			for i := range filaments {
+				if _, have := filaments[i].Dict[k]; !have {
+					filaments[i].Dict[k] = v
+				}
+			}
+		}
+	}
+
+	// Temperatures the phone sends along: they replace the filament's own
+	// values. The bed temperature belongs to the plate type, so it is written
+	// to the keys of the plate this printer uses.
+	bedTypeForTemps, _ := machine.Dict["default_bed_type"].(string)
+	if bedTypeForTemps == "" {
+		bedTypeForTemps = "Textured PEI Plate"
+	}
+	if list, ok := spec["nozzle_temps"].([]any); ok {
+		for i, v := range list {
+			if i >= len(filaments) {
+				break
+			}
+			if f, ok := numOf(v); ok && f > 0 {
+				t := strconv.Itoa(int(math.Round(f)))
+				filaments[i].Dict["nozzle_temperature"] = []string{t}
+				filaments[i].Dict["nozzle_temperature_initial_layer"] = []string{t}
+			}
+		}
+	}
+	if f, ok := numOf(spec["bed_temp"]); ok && f > 0 {
+		t := strconv.Itoa(int(math.Round(f)))
+		key := plateTempKey(bedTypeForTemps)
+		for i := range filaments {
+			filaments[i].Dict[key] = []string{t}
+			filaments[i].Dict[key+"_initial_layer"] = []string{t}
+		}
+	}
 
 	writeJSON := func(obj JSONObject, name string) (string, error) {
 		p := filepath.Join(job.Dir, name)
@@ -372,18 +424,63 @@ func (r *SliceRunner) run(job *SliceJob) error {
 		filPaths = append(filPaths, p)
 	}
 	logPath := filepath.Join(job.Dir, "orca.log")
+	// The bed type is a project setting in Orca's GUI; the CLI falls back to
+	// "Cool Plate", and most filaments have 0 °C for that — the printer then
+	// warns about a cold bed. So the printer's own default plate is passed.
+	bedType, _ := machine.Dict["default_bed_type"].(string)
+	if bedType == "" {
+		bedType = "Textured PEI Plate"
+	}
 	args := []string{modelPath,
 		"--load-settings", machinePath + ";" + processPath,
 		"--load-filaments", strings.Join(filPaths, ";"),
 		"--arrange", "0", "--slice", "0",
-		"--outputdir", job.Dir, "--debug", "2", "--logfile", logPath}
+		"--outputdir", job.Dir, "--debug", "2", "--logfile", logPath,
+		"--curr-bed-type=" + bedType}
 	if ov, ok := spec["overrides"].(JSONObject); ok {
+		known := map[string]bool{}
 		for _, o := range overrides {
+			known[o.key] = true
 			if v, ok := ov[o.key]; ok {
 				if a := overrideFlag(o.flag, o.kind, v); a != "" {
 					args = append(args, a)
 				}
 			}
+		}
+		// Settings the app added on its own (its editor offers every key
+		// OrcaSlicer knows). The CLI takes any config key as an option, so
+		// these go through unchanged — only the key is checked, so nothing
+		// but a setting can end up in the argument list.
+		keys := make([]string, 0, len(ov))
+		for k := range ov {
+			if !known[k] {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if !validOverrideKey.MatchString(k) {
+				continue
+			}
+			var value string
+			switch x := ov[k].(type) {
+			case bool:
+				if x {
+					value = "1"
+				} else {
+					value = "0"
+				}
+			case float64:
+				value = strconv.FormatFloat(x, 'g', -1, 64)
+			case string:
+				value = x
+			default:
+				continue
+			}
+			if value == "" || strings.ContainsAny(value, "\n\r") {
+				continue
+			}
+			args = append(args, "--"+strings.ReplaceAll(k, "_", "-")+"="+value)
 		}
 	}
 	// One head: the plate is sliced for T0 and the G-code rewritten to
@@ -536,6 +633,23 @@ func unionStrings(a, b []string) []string {
 		out = []string{}
 	}
 	return out
+}
+
+// Which filament key holds the bed temperature depends on the plate the
+// printer uses.
+func plateTempKey(bedType string) string {
+	t := strings.ToLower(bedType)
+	switch {
+	case strings.Contains(t, "textured"):
+		return "textured_plate_temp"
+	case strings.Contains(t, "engineering"):
+		return "eng_plate_temp"
+	case strings.Contains(t, "high temp"):
+		return "hot_plate_temp"
+	case strings.Contains(t, "supertack"), strings.Contains(t, "cool"):
+		return "cool_plate_temp"
+	}
+	return "hot_plate_temp"
 }
 
 // Orca's CLI exit codes that a phone user can actually do something about.

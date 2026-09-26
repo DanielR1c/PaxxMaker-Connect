@@ -11,12 +11,13 @@ struct OrcaApp {
     let dataDir: URL
     let confName: String
 
+    // Only OrcaSlicer. Reading Snapmaker Orca's folder as well split the
+    // presets over two sources: the U1 pulled its profiles from there, so
+    // the filaments saved in OrcaSlicer were missing. OrcaSlicer ships the
+    // Snapmaker profiles too, so one source is enough.
     static let all: [OrcaApp] = {
         let base = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        return [
-            OrcaApp(key: "snapmaker_orca", dataDir: base.appendingPathComponent("Snapmaker_Orca"), confName: "Snapmaker_Orca.conf"),
-            OrcaApp(key: "orca", dataDir: base.appendingPathComponent("OrcaSlicer"), confName: "OrcaSlicer.conf"),
-        ]
+        return [OrcaApp(key: "orca", dataDir: base.appendingPathComponent("OrcaSlicer"), confName: "OrcaSlicer.conf")]
     }()
     static var installed: [OrcaApp] { all.filter { FileManager.default.fileExists(atPath: $0.dataDir.path) } }
     static func named(_ key: String) -> OrcaApp? { installed.first { $0.key == key } }
@@ -142,6 +143,9 @@ final class ProfileIndex {
                 var ok = origin == "user"
                 if origin == "system" {
                     var sys = (d["instantiation"] as? String ?? "").lowercased() == "true"
+                    // Exactly the filaments ticked in Orca's wizard — taking
+                    // every filament the printer could use buries the handful
+                    // that are actually loaded.
                     if kind == "filament", !enabledFilaments.isEmpty { sys = sys && enabledFilaments.contains(name) }
                     if kind == "machine", !usedMachines.isEmpty { sys = sys && usedMachines.contains(name) }
                     ok = sys
@@ -164,6 +168,27 @@ final class ProfileIndex {
             res[kind] = items
         }
         return res
+    }
+
+    /// Per-extruder values collected from this printer's own system
+    /// filaments. Thin user presets often lack keys (ramming, cooling,
+    /// `filament_is_support` …) that Orca needs once several filaments are
+    /// loaded at once — and no single system preset carries them all, so the
+    /// union of them is used.
+    func referenceFilamentValues(for machineNames: Set<String>) -> JSONObject {
+        var out: JSONObject = [:]
+        let names = (byName["filament"] ?? [:]).filter { (_, e) in
+            e.1 == "system" && (e.0["instantiation"] as? String ?? "").lowercased() == "true"
+        }.keys.sorted()
+        for name in names {
+            let compat = Set(effectiveCompatible(kind: "filament", name: name) ?? [])
+            guard !compat.isDisjoint(with: machineNames) else { continue }
+            guard let d = resolve(kind: "filament", name: name)?.dict else { continue }
+            for (k, v) in d where k.hasPrefix("filament_") && v is [Any] && out[k] == nil {
+                out[k] = v
+            }
+        }
+        return out
     }
 
     /// Bed and head count from a machine preset's printable_area.
