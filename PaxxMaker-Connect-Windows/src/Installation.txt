@@ -1,62 +1,19 @@
-PaxxMaker-Connect für Windows (Deutsch)                     English version below
-======================================
+PaxxMaker-Connect for Windows
+=============================
 
-Starten
+Install
 -------
-1. Diesen Ordner entpacken (nicht direkt aus dem ZIP starten).
-2. Doppelklick auf „PaxxMaker-Connect.exe“ – im Browser geht die Seite mit
-   Kopplungscode und QR-Code auf. Mehr ist nicht nötig.
-   Meldet Windows „Der Computer wurde durch Windows geschützt“ (SmartScreen):
-   „Weitere Informationen“ › „Trotzdem ausführen“ – das ist nur einmal nötig.
-3. Fragt die Windows-Firewall nach dem Zugriff: „Zugriff zulassen“
-   (privates Netz) – sonst findet das iPhone den PC nicht.
+1. Extract "PaxxMaker-Connect-....zip" completely. Do not run the app from
+   inside the ZIP.
+2. Double-click "PaxxMaker-Connect Install.cmd".
+3. The app is copied to %LocalAppData%\Programs\PaxxMaker-Connect and a
+   Start Menu entry is created.
+4. Optionally enable the firewall rule and autostart.
+5. On the first launch, confirm the SmartScreen prompt with
+   More info -> Run anyway, because the file is not signed.
+6. Allow access for private networks when Windows Firewall asks.
 
-Die Seite kann jederzeit geschlossen werden: PaxxMaker-Connect läuft dann als
-Symbol im Infobereich der Taskleiste weiter (rechts unten, ggf. hinter dem
-Pfeil). Die Seite kommt zurück über das Symbol › „Kopplung anzeigen…“ oder
-indem man die .exe einfach nochmal startet.
-
-Voraussetzung: OrcaSlicer
--------------------------
-OrcaSlicer muss installiert sein: https://github.com/OrcaSlicer/OrcaSlicer/releases
-Wichtig: OrcaSlicer einmal starten und den Einrichtungs-Assistenten mit dem
-eigenen Drucker durchlaufen. Erst danach gibt es Druckprofile – vorher meldet
-PaxxMaker-Connect „Keine Orca-Profile gefunden“.
-Für den Snapmaker U1 bringt OrcaSlicer die Profile selbst mit; Snapmaker Orca
-wird unter Windows nicht gebraucht.
-
-Verbinden
----------
-Auf dem iPhone/iPad in PaxxMaker: Slicer › „Per QR-Code verbinden“ und den
-QR-Code scannen – oder „Manuell verbinden“ und den 6-stelligen Code eintippen.
-PC und iPhone müssen im selben WLAN/Netzwerk sein.
-
-Optional: fest installieren
----------------------------
-„PaxxMaker-Connect Install.cmd“ kopiert das Programm nach
-%LOCALAPPDATA%\Programs\PaxxMaker-Connect, legt einen Startmenü-Eintrag an und
-fragt nach Firewall-Regel und Autostart. Nötig ist das nicht – die .exe läuft
-auch direkt aus diesem Ordner.
-Entfernen: „PaxxMaker-Connect Deinstall.cmd“.
-
-
-PaxxMaker-Connect for Windows (English)
-=======================================
-
-Start
------
-1. Unpack this folder (do not run it straight from the ZIP).
-2. Double-click "PaxxMaker-Connect.exe" – your browser opens the page with the
-   pairing code and QR code. That is all it takes.
-   If Windows shows "Windows protected your PC" (SmartScreen): "More info" ›
-   "Run anyway" – needed only once.
-3. If the Windows firewall asks: "Allow access" (private network) – otherwise
-   the iPhone cannot find the PC.
-
-You can close the page at any time: PaxxMaker-Connect keeps running as an icon
-in the taskbar's notification area (bottom right, maybe behind the arrow).
-To bring the page back use the icon › "Show pairing…", or simply start the
-.exe again.
+To uninstall, run "PaxxMaker-Connect Deinstall.cmd".
 
 Requirement: OrcaSlicer
 -----------------------
@@ -72,11 +29,3 @@ Connect
 On the iPhone/iPad in PaxxMaker: Slicer › "Connect with QR code" and scan the
 QR code – or "Connect manually" and type the 6-character code.
 PC and iPhone must be on the same Wi-Fi/network.
-
-Optional: install properly
---------------------------
-"PaxxMaker-Connect Install.cmd" copies the program to
-%LOCALAPPDATA%\Programs\PaxxMaker-Connect, adds a Start menu entry and asks
-about a firewall rule and autostart. It is not required – the .exe also runs
-straight from this folder.
-Remove: "PaxxMaker-Connect Deinstall.cmd".
