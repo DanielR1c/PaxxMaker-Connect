@@ -4,7 +4,9 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%2013%2B%20%7C%20Windows%2010%2B-blue)](#requirements)
 [![Status](https://img.shields.io/badge/Status-Beta-yellow)](#project-status)
 
-PaxxMaker-Connect is a small macOS and Windows helper application that connects the iPhone/iPad app PaxxMaker with a locally installed OrcaSlicer instance.
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/paxxmaker)
+
+PaxxMaker-Connect is a small macOS and Windows helper application that connects the iPhone/iPad app [PaxxMaker](https://github.com/DanielR1c/Paxxmaker-iOS-App)  with a locally installed OrcaSlicer instance.
 The model is positioned, rotated, scaled and painted on the mobile device. PaxxMaker-Connect runs OrcaSlicer headlessly in the background and sends the generated G-code back to the app, which can then send it to the printer.
 No cloud, no account. Communication stays entirely on the local network. The pairing code is stored only on the computer and on the paired device.
 PaxxMaker-Connect does not modify OrcaSlicer. It only reads its profiles and uses OrcaSlicer's command-line interface.
