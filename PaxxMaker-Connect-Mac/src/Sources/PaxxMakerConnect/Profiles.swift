@@ -30,17 +30,40 @@ final class ProfileIndex {
     let app: OrcaApp
     /// kind → name → (dict, origin "user"/"system")
     private var byName: [String: [String: (JSONObject, String)]] = ["machine": [:], "process": [:], "filament": [:]]
+    /// Names repeat across vendors ("Generic PETG" is in BBL and Snapmaker), so
+    /// a parent is looked up the way Orca does: inside the preset's own vendor.
+    /// kind → "vendor/name" → system entry, and kind → name → its vendor.
+    private var byVendor: [String: [String: (JSONObject, String)]] = ["machine": [:], "process": [:], "filament": [:]]
+    private var vendorOf: [String: [String: String]] = ["machine": [:], "process": [:], "filament": [:]]
+
+    /// A preset in an inheritance chain, with the vendor its parents come from.
+    typealias Link = (d: JSONObject, origin: String, name: String, vendor: String?)
 
     init(app: OrcaApp) {
         self.app = app
         scan()
     }
 
-    private func add(kind: String, url: URL, origin: String) {
+    @discardableResult
+    private func add(kind: String, url: URL, origin: String, vendor: String? = nil) -> String? {
         guard let d = try? Data(contentsOf: url),
-              let obj = try? JSONSerialization.jsonObject(with: d) as? JSONObject else { return }
+              let obj = try? JSONSerialization.jsonObject(with: d) as? JSONObject else { return nil }
         let name = obj["name"] as? String ?? url.deletingPathExtension().lastPathComponent
-        if byName[kind]?[name] == nil { byName[kind]?[name] = (obj, origin) }
+        if byName[kind]?[name] == nil { byName[kind]?[name] = (obj, origin); vendorOf[kind]?[name] = vendor }
+        if let v = vendor, byVendor[kind]?["\(v)/\(name)"] == nil { byVendor[kind]?["\(v)/\(name)"] = (obj, origin) }
+        return name
+    }
+
+    private func link(kind: String, name: String) -> Link? {
+        guard let (d, origin) = byName[kind]?[name] else { return nil }
+        return (d, origin, name, vendorOf[kind]?[name])
+    }
+
+    /// The preset `l` inherits from, inside its vendor when that vendor has it.
+    private func parent(kind: String, of l: Link) -> Link? {
+        guard let p = l.d["inherits"] as? String, !p.isEmpty else { return nil }
+        if let v = l.vendor, let (d, origin) = byVendor[kind]?["\(v)/\(p)"] { return (d, origin, p, v) }
+        return link(kind: kind, name: p)
     }
 
     private func jsonFiles(under dir: URL) -> [URL] {
@@ -52,9 +75,17 @@ final class ProfileIndex {
         let fm = FileManager.default
         // User presets first so they win over a same-named system one.
         let userRoot = app.dataDir.appendingPathComponent("user")
+        var baseIDs: [(kind: String, name: String, id: String)] = []
         for userDir in (try? fm.contentsOfDirectory(at: userRoot, includingPropertiesForKeys: nil)) ?? [] {
             for kind in Self.kinds {
-                for f in jsonFiles(under: userDir.appendingPathComponent(kind)) { add(kind: kind, url: f, origin: "user") }
+                for f in jsonFiles(under: userDir.appendingPathComponent(kind)) {
+                    // Orca's .info next to a user preset names its parent's setting_id.
+                    if let name = add(kind: kind, url: f, origin: "user"),
+                       let info = try? String(contentsOf: f.deletingPathExtension().appendingPathExtension("info"), encoding: .utf8),
+                       let line = info.split(separator: "\n").first(where: { $0.hasPrefix("base_id") }) {
+                        baseIDs.append((kind, name, line.split(separator: "=").dropFirst().joined().trimmingCharacters(in: .whitespaces)))
+                    }
+                }
             }
         }
         // System: own app first, then the other Orca's as a fallback for chains
@@ -64,8 +95,15 @@ final class ProfileIndex {
             let sysRoot = a.dataDir.appendingPathComponent("system")
             for vendor in (try? fm.contentsOfDirectory(at: sysRoot, includingPropertiesForKeys: nil)) ?? [] {
                 for kind in Self.kinds {
-                    for f in jsonFiles(under: vendor.appendingPathComponent(kind)) { add(kind: kind, url: f, origin: "system") }
+                    for f in jsonFiles(under: vendor.appendingPathComponent(kind)) { add(kind: kind, url: f, origin: "system", vendor: vendor.lastPathComponent) }
                 }
+            }
+        }
+        // A user preset's vendor is that of the system preset its base_id names.
+        for (kind, name, id) in baseIDs {
+            let parent = byName[kind]?[name]?.0["inherits"] as? String
+            if let key = byVendor[kind]?.first(where: { $0.value.0["setting_id"] as? String == id && $0.value.0["name"] as? String == parent })?.key {
+                vendorOf[kind]?[name] = String(key.prefix(while: { $0 != "/" }))
             }
         }
     }
@@ -89,12 +127,17 @@ final class ProfileIndex {
     /// Flattened dict: base chain first, own keys last. `inherits` keeps the
     /// nearest SYSTEM ancestor — the CLI derives the printer's system name
     /// from it for its process/printer compatibility check.
-    func resolve(kind: String, name: String, depth: Int = 0) -> Resolved? {
-        guard depth < 20, let (d, origin) = byName[kind]?[name] else { return nil }
+    func resolve(kind: String, name: String) -> Resolved? {
+        link(kind: kind, name: name).flatMap { resolve(kind: kind, $0, depth: 0) }
+    }
+
+    private func resolve(kind: String, _ l: Link, depth: Int) -> Resolved? {
+        guard depth < 20 else { return nil }
+        let (d, origin, name, _) = l
         var out: JSONObject = [:]
         var missing: String? = nil
         if let parent = d["inherits"] as? String, !parent.isEmpty {
-            if let base = resolve(kind: kind, name: parent, depth: depth + 1) {
+            if let p = self.parent(kind: kind, of: l), let base = resolve(kind: kind, p, depth: depth + 1) {
                 out = base.dict
                 missing = base.missingParent
             } else {
@@ -104,17 +147,16 @@ final class ProfileIndex {
         for (k, v) in d where k != "inherits" { out[k] = v }
         out["name"] = name
         out["from"] = origin == "system" ? "system" : "User"
-        out["inherits"] = systemAncestor(kind: kind, name: name) ?? ""
+        out["inherits"] = systemAncestor(kind: kind, from: l) ?? ""
         return Resolved(dict: out, missingParent: missing)
     }
 
-    func systemAncestor(kind: String, name: String) -> String? {
-        var cur = name
+    func systemAncestor(kind: String, from l: Link) -> String? {
+        var cur: Link? = l
         for _ in 0..<20 {
-            guard let (d, origin) = byName[kind]?[cur] else { return nil }
-            if origin == "system" { return cur }
-            guard let p = d["inherits"] as? String, !p.isEmpty else { return nil }
-            cur = p
+            guard let c = cur else { return nil }
+            if c.origin == "system" { return c.name }
+            cur = parent(kind: kind, of: c)
         }
         return nil
     }
@@ -124,12 +166,11 @@ final class ProfileIndex {
     /// `compatible_printers` as Orca sees it: the preset's own value, else the
     /// nearest ancestor's (user presets store only their diff).
     func effectiveCompatible(kind: String, name: String) -> [String]? {
-        var cur = name
+        var cur = link(kind: kind, name: name)
         for _ in 0..<20 {
-            guard let (d, _) = byName[kind]?[cur] else { return nil }
-            if let c = d["compatible_printers"] as? [String] { return c }
-            guard let p = d["inherits"] as? String, !p.isEmpty else { return nil }
-            cur = p
+            guard let c = cur else { return nil }
+            if let list = c.d["compatible_printers"] as? [String] { return list }
+            cur = parent(kind: kind, of: c)
         }
         return nil
     }

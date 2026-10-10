@@ -84,25 +84,39 @@ type presetEntry struct {
 	dict   JSONObject
 	origin string // "user" / "system"
 	hidden bool   // unpacked from an AppImage: resolves inherits, never listed
+	vendor string // where its parents are looked up first (see parent)
+	baseID string // user preset: its parent's setting_id, from the .info file
 }
 
+// Names repeat across vendors ("Generic PETG" is in BBL and Snapmaker), so a
+// parent is looked up the way Orca does: inside the preset's own vendor.
 type ProfileIndex struct {
-	App    OrcaApp
-	byName map[string]map[string]presetEntry // kind → name → entry
+	App      OrcaApp
+	byName   map[string]map[string]presetEntry // kind → name → entry
+	byVendor map[string]map[string]presetEntry // kind → vendor/name → system entry
 }
 
 func NewProfileIndex(app OrcaApp) *ProfileIndex {
-	idx := &ProfileIndex{App: app, byName: map[string]map[string]presetEntry{}}
+	idx := &ProfileIndex{App: app, byName: map[string]map[string]presetEntry{}, byVendor: map[string]map[string]presetEntry{}}
 	for _, k := range profileKinds {
 		idx.byName[k] = map[string]presetEntry{}
+		idx.byVendor[k] = map[string]presetEntry{}
 	}
 	idx.scan()
 	return idx
 }
 
-func (idx *ProfileIndex) add(kind, path, origin string) {
+func (idx *ProfileIndex) add(kind, path, origin, vendor string) {
 	if name, obj := readPreset(path); obj != nil {
-		idx.put(kind, name, presetEntry{dict: obj, origin: origin})
+		e := presetEntry{dict: obj, origin: origin, vendor: vendor}
+		if info, err := os.ReadFile(strings.TrimSuffix(path, filepath.Ext(path)) + ".info"); err == nil {
+			for _, line := range strings.Split(string(info), "\n") {
+				if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == "base_id" {
+					e.baseID = strings.TrimSpace(v)
+				}
+			}
+		}
+		idx.put(kind, name, e)
 	}
 }
 
@@ -110,6 +124,19 @@ func (idx *ProfileIndex) put(kind, name string, e presetEntry) {
 	if _, dup := idx.byName[kind][name]; !dup {
 		idx.byName[kind][name] = e
 	}
+	if _, dup := idx.byVendor[kind][e.vendor+"/"+name]; e.vendor != "" && !dup {
+		idx.byVendor[kind][e.vendor+"/"+name] = e
+	}
+}
+
+// The preset e inherits from, inside e's vendor when there is one.
+func (idx *ProfileIndex) parent(kind string, e presetEntry) (presetEntry, string, bool) {
+	name, _ := e.dict["inherits"].(string)
+	if p, ok := idx.byVendor[kind][e.vendor+"/"+name]; ok {
+		return p, name, true
+	}
+	p, ok := idx.byName[kind][name]
+	return p, name, ok
 }
 
 func readPreset(path string) (string, JSONObject) {
@@ -129,13 +156,18 @@ func readPreset(path string) (string, JSONObject) {
 }
 
 // The AppImage vendor trees hold ~10,000 presets each and never change for
-// one AppImage, so they are parsed once per folder and kept (kind → name).
+// one AppImage, so they are parsed once per folder and kept (kind → list).
 var (
 	bundledIdxMu sync.Mutex
-	bundledIdx   = map[string]map[string]map[string]JSONObject{}
+	bundledIdx   = map[string]map[string][]bundledPreset{}
 )
 
-func bundledPresets(root string) map[string]map[string]JSONObject {
+type bundledPreset struct {
+	name, vendor string
+	obj          JSONObject
+}
+
+func bundledPresets(root string) map[string][]bundledPreset {
 	bundledIdxMu.Lock()
 	defer bundledIdxMu.Unlock()
 	// Keyed by the folder's time too: a new AppImage is unpacked afresh.
@@ -146,18 +178,13 @@ func bundledPresets(root string) map[string]map[string]JSONObject {
 	if m, ok := bundledIdx[key]; ok {
 		return m
 	}
-	m := map[string]map[string]JSONObject{}
-	for _, kind := range profileKinds {
-		m[kind] = map[string]JSONObject{}
-	}
+	m := map[string][]bundledPreset{}
 	vendors, _ := os.ReadDir(root)
 	for _, v := range vendors {
 		for _, kind := range profileKinds {
 			for _, f := range jsonFilesUnder(filepath.Join(root, v.Name(), kind)) {
 				if name, obj := readPreset(f); obj != nil {
-					if _, dup := m[kind][name]; !dup {
-						m[kind][name] = obj
-					}
+					m[kind] = append(m[kind], bundledPreset{name, v.Name(), obj})
 				}
 			}
 		}
@@ -185,7 +212,7 @@ func (idx *ProfileIndex) scan() {
 		for _, d := range dirs {
 			for _, kind := range profileKinds {
 				for _, f := range jsonFilesUnder(filepath.Join(userRoot, d.Name(), kind)) {
-					idx.add(kind, f, "user")
+					idx.add(kind, f, "user", "")
 				}
 			}
 		}
@@ -208,7 +235,7 @@ func (idx *ProfileIndex) scan() {
 		for _, v := range vendors {
 			for _, kind := range profileKinds {
 				for _, f := range jsonFilesUnder(filepath.Join(sysRoot, v.Name(), kind)) {
-					idx.add(kind, f, "system")
+					idx.add(kind, f, "system", v.Name())
 				}
 			}
 		}
@@ -216,9 +243,24 @@ func (idx *ProfileIndex) scan() {
 	// The AppImage copies come last, so they never shadow a listed preset.
 	for _, a := range apps {
 		if root := bundledProfiles(a.Key); root != "" {
-			for kind, m := range bundledPresets(root) {
-				for name, obj := range m {
-					idx.put(kind, name, presetEntry{dict: obj, origin: "system", hidden: true})
+			for kind, list := range bundledPresets(root) {
+				for _, b := range list {
+					idx.put(kind, b.name, presetEntry{dict: b.obj, origin: "system", hidden: true, vendor: b.vendor})
+				}
+			}
+		}
+	}
+	// A user preset's vendor is that of the system preset its .info base_id
+	// names (Orca's own link to the parent).
+	for kind, m := range idx.byName {
+		for name, e := range m {
+			if e.baseID == "" {
+				continue
+			}
+			for _, s := range idx.byVendor[kind] {
+				if s.dict["setting_id"] == e.baseID && s.dict["name"] == e.dict["inherits"] {
+					e.vendor = s.vendor
+					m[name] = e
 				}
 			}
 		}
@@ -276,21 +318,21 @@ type Resolved struct {
 // nearest SYSTEM ancestor — the CLI derives the printer's system name
 // from it for its process/printer compatibility check.
 func (idx *ProfileIndex) Resolve(kind, name string) (Resolved, bool) {
-	return idx.resolve(kind, name, 0)
-}
-
-func (idx *ProfileIndex) resolve(kind, name string, depth int) (Resolved, bool) {
-	if depth >= 20 {
-		return Resolved{}, false
-	}
 	e, ok := idx.byName[kind][name]
 	if !ok {
 		return Resolved{}, false
 	}
+	return idx.resolve(kind, name, e, 0)
+}
+
+func (idx *ProfileIndex) resolve(kind, name string, e presetEntry, depth int) (Resolved, bool) {
+	if depth >= 20 {
+		return Resolved{}, false
+	}
 	out := JSONObject{}
 	missing := ""
-	if parent, _ := e.dict["inherits"].(string); parent != "" {
-		if base, ok := idx.resolve(kind, parent, depth+1); ok {
+	if p, parent, found := idx.parent(kind, e); parent != "" {
+		if base, ok := idx.resolve(kind, parent, p, depth+1); found && ok {
 			out = base.Dict
 			missing = base.MissingParent
 		} else {
@@ -308,25 +350,16 @@ func (idx *ProfileIndex) resolve(kind, name string, depth int) (Resolved, bool) 
 	} else {
 		out["from"] = "User"
 	}
-	out["inherits"] = idx.systemAncestor(kind, name)
+	out["inherits"] = idx.systemAncestor(kind, name, e)
 	return Resolved{Dict: out, MissingParent: missing}, true
 }
 
-func (idx *ProfileIndex) systemAncestor(kind, name string) string {
-	cur := name
-	for i := 0; i < 20; i++ {
-		e, ok := idx.byName[kind][cur]
-		if !ok {
-			return ""
-		}
+func (idx *ProfileIndex) systemAncestor(kind, name string, e presetEntry) string {
+	for ok, i := true, 0; ok && i < 20; i++ {
 		if e.origin == "system" {
-			return cur
+			return name
 		}
-		p, _ := e.dict["inherits"].(string)
-		if p == "" {
-			return ""
-		}
-		cur = p
+		e, name, ok = idx.parent(kind, e)
 	}
 	return ""
 }
@@ -342,22 +375,14 @@ type Preset struct {
 // `compatible_printers` as Orca sees it: the preset's own value, else the
 // nearest ancestor's (user presets store only their diff).
 func (idx *ProfileIndex) effectiveCompatible(kind, name string) []string {
-	cur := name
-	for i := 0; i < 20; i++ {
-		e, ok := idx.byName[kind][cur]
-		if !ok {
-			return nil
-		}
+	e, ok := idx.byName[kind][name]
+	for i := 0; ok && i < 20; i++ {
 		if c, ok := e.dict["compatible_printers"]; ok {
 			if _, isList := c.([]any); isList {
 				return toStringSlice(c)
 			}
 		}
-		p, _ := e.dict["inherits"].(string)
-		if p == "" {
-			return nil
-		}
-		cur = p
+		e, _, ok = idx.parent(kind, e)
 	}
 	return nil
 }
