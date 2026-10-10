@@ -84,26 +84,22 @@ type presetEntry struct {
 	dict   JSONObject
 	origin string // "user" / "system"
 	hidden bool   // unpacked from an AppImage: resolves inherits, never listed
-	vendor string // system vendor folder; parents resolve inside it first
-	baseID string // user preset's .info base_id = its parent's setting_id
+	vendor string // where its parents are looked up first (see parent)
+	baseID string // user preset: its parent's setting_id, from the .info file
 }
 
+// Names repeat across vendors ("Generic PETG" is in BBL and Snapmaker), so a
+// parent is looked up the way Orca does: inside the preset's own vendor.
 type ProfileIndex struct {
-	App    OrcaApp
-	byName map[string]map[string]presetEntry // kind → name → entry
-	// Names are not unique across vendors ("Generic PETG" is in BBL and
-	// Snapmaker), so parents are looked up the way Orca does: a user preset
-	// by its .info base_id, a system preset inside its own vendor.
-	byID     map[string]map[string]presetEntry // kind → setting_id+"/"+name → entry (ids repeat too)
-	byVendor map[string]map[string]presetEntry // kind → vendor+"/"+name → entry
+	App      OrcaApp
+	byName   map[string]map[string]presetEntry // kind → name → entry
+	byVendor map[string]map[string]presetEntry // kind → vendor/name → system entry
 }
 
 func NewProfileIndex(app OrcaApp) *ProfileIndex {
-	idx := &ProfileIndex{App: app, byName: map[string]map[string]presetEntry{},
-		byID: map[string]map[string]presetEntry{}, byVendor: map[string]map[string]presetEntry{}}
+	idx := &ProfileIndex{App: app, byName: map[string]map[string]presetEntry{}, byVendor: map[string]map[string]presetEntry{}}
 	for _, k := range profileKinds {
 		idx.byName[k] = map[string]presetEntry{}
-		idx.byID[k] = map[string]presetEntry{}
 		idx.byVendor[k] = map[string]presetEntry{}
 	}
 	idx.scan()
@@ -113,8 +109,12 @@ func NewProfileIndex(app OrcaApp) *ProfileIndex {
 func (idx *ProfileIndex) add(kind, path, origin, vendor string) {
 	if name, obj := readPreset(path); obj != nil {
 		e := presetEntry{dict: obj, origin: origin, vendor: vendor}
-		if origin == "user" {
-			e.baseID = infoBaseID(strings.TrimSuffix(path, filepath.Ext(path)) + ".info")
+		if info, err := os.ReadFile(strings.TrimSuffix(path, filepath.Ext(path)) + ".info"); err == nil {
+			for _, line := range strings.Split(string(info), "\n") {
+				if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == "base_id" {
+					e.baseID = strings.TrimSpace(v)
+				}
+			}
 		}
 		idx.put(kind, name, e)
 	}
@@ -124,55 +124,19 @@ func (idx *ProfileIndex) put(kind, name string, e presetEntry) {
 	if _, dup := idx.byName[kind][name]; !dup {
 		idx.byName[kind][name] = e
 	}
-	if e.origin != "system" {
-		return
-	}
-	if id, _ := e.dict["setting_id"].(string); id != "" {
-		if _, dup := idx.byID[kind][id+"/"+name]; !dup {
-			idx.byID[kind][id+"/"+name] = e
-		}
-	}
-	if e.vendor != "" {
-		if _, dup := idx.byVendor[kind][e.vendor+"/"+name]; !dup {
-			idx.byVendor[kind][e.vendor+"/"+name] = e
-		}
+	if _, dup := idx.byVendor[kind][e.vendor+"/"+name]; e.vendor != "" && !dup {
+		idx.byVendor[kind][e.vendor+"/"+name] = e
 	}
 }
 
-// Orca writes a "<preset>.info" next to each user preset; its base_id is
-// the setting_id of the system preset it was derived from.
-func infoBaseID(path string) string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+// The preset e inherits from, inside e's vendor when there is one.
+func (idx *ProfileIndex) parent(kind string, e presetEntry) (presetEntry, string, bool) {
+	name, _ := e.dict["inherits"].(string)
+	if p, ok := idx.byVendor[kind][e.vendor+"/"+name]; ok {
+		return p, name, true
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == "base_id" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
-}
-
-// The entry a preset inherits from, or ok=false when it has no parent.
-// found=false means the parent is named but missing.
-func (idx *ProfileIndex) parent(kind string, e presetEntry) (p presetEntry, name string, ok, found bool) {
-	name, _ = e.dict["inherits"].(string)
-	if name == "" {
-		return presetEntry{}, "", false, false
-	}
-	if e.baseID != "" {
-		if b, hit := idx.byID[kind][e.baseID+"/"+name]; hit {
-			return b, name, true, true
-		}
-	}
-	if e.vendor != "" {
-		if b, hit := idx.byVendor[kind][e.vendor+"/"+name]; hit {
-			return b, name, true, true
-		}
-	}
-	b, hit := idx.byName[kind][name]
-	return b, name, true, hit
+	p, ok := idx.byName[kind][name]
+	return p, name, ok
 }
 
 func readPreset(path string) (string, JSONObject) {
@@ -192,7 +156,7 @@ func readPreset(path string) (string, JSONObject) {
 }
 
 // The AppImage vendor trees hold ~10,000 presets each and never change for
-// one AppImage, so they are parsed once per folder and kept (kind → name).
+// one AppImage, so they are parsed once per folder and kept (kind → list).
 var (
 	bundledIdxMu sync.Mutex
 	bundledIdx   = map[string]map[string][]bundledPreset{}
@@ -286,6 +250,21 @@ func (idx *ProfileIndex) scan() {
 			}
 		}
 	}
+	// A user preset's vendor is that of the system preset its .info base_id
+	// names (Orca's own link to the parent).
+	for kind, m := range idx.byName {
+		for name, e := range m {
+			if e.baseID == "" {
+				continue
+			}
+			for _, s := range idx.byVendor[kind] {
+				if s.dict["setting_id"] == e.baseID && s.dict["name"] == e.dict["inherits"] {
+					e.vendor = s.vendor
+					m[name] = e
+				}
+			}
+		}
+	}
 }
 
 // Orca's own config: which system filaments were ticked, which printers used.
@@ -352,10 +331,8 @@ func (idx *ProfileIndex) resolve(kind, name string, e presetEntry, depth int) (R
 	}
 	out := JSONObject{}
 	missing := ""
-	if pe, parent, has, found := idx.parent(kind, e); has {
-		if !found {
-			missing = parent
-		} else if base, ok := idx.resolve(kind, parent, pe, depth+1); ok {
+	if p, parent, found := idx.parent(kind, e); parent != "" {
+		if base, ok := idx.resolve(kind, parent, p, depth+1); found && ok {
 			out = base.Dict
 			missing = base.MissingParent
 		} else {
@@ -378,15 +355,11 @@ func (idx *ProfileIndex) resolve(kind, name string, e presetEntry, depth int) (R
 }
 
 func (idx *ProfileIndex) systemAncestor(kind, name string, e presetEntry) string {
-	for i := 0; i < 20; i++ {
+	for ok, i := true, 0; ok && i < 20; i++ {
 		if e.origin == "system" {
 			return name
 		}
-		pe, p, has, found := idx.parent(kind, e)
-		if !has || !found {
-			return ""
-		}
-		e, name = pe, p
+		e, name, ok = idx.parent(kind, e)
 	}
 	return ""
 }
@@ -403,20 +376,13 @@ type Preset struct {
 // nearest ancestor's (user presets store only their diff).
 func (idx *ProfileIndex) effectiveCompatible(kind, name string) []string {
 	e, ok := idx.byName[kind][name]
-	if !ok {
-		return nil
-	}
-	for i := 0; i < 20; i++ {
+	for i := 0; ok && i < 20; i++ {
 		if c, ok := e.dict["compatible_printers"]; ok {
 			if _, isList := c.([]any); isList {
 				return toStringSlice(c)
 			}
 		}
-		pe, _, has, found := idx.parent(kind, e)
-		if !has || !found {
-			return nil
-		}
-		e = pe
+		e, _, ok = idx.parent(kind, e)
 	}
 	return nil
 }
