@@ -25,7 +25,12 @@ final class ConnectState: ObservableObject {
     @Published var running = false
     @Published var lastError: String? = nil
     @Published var log: [String] = []
+    /// What the menu shows — only ever changed on the main thread.
     @Published var jobs: [SliceJob] = []
+    /// The jobs the HTTP side works with (any thread, under `lock`). Changing
+    /// the @Published list from the server's threads made SwiftUI rebuild the
+    /// menu off the main thread and deadlock the whole service.
+    private var jobStore: [SliceJob] = []
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     let token: String
@@ -106,7 +111,12 @@ final class ConnectState: ObservableObject {
     }
     var orcaInstalled: Bool { Orca.installed }
     var orcaVersion: String? { Orca.version }
-    var installedApps: [OrcaApp] { OrcaApp.installed }
+    var installedApps: [OrcaApp] { OrcaApp.ordered }
+    /// Where the profiles come from — chosen in the menu, saved.
+    var profileSource: String {
+        get { OrcaApp.defaultKey }
+        set { OrcaApp.defaultKey = newValue; objectWillChange.send(); append(L("Profile aus ", "Profiles from ") + (OrcaApp.named(newValue)?.displayName ?? newValue)) }
+    }
 
     func start() {
         let s = HTTPServer(port: Self.port) { [weak self] req in self?.route(req) ?? .json(["error": "gone"], status: 500) }
@@ -164,14 +174,23 @@ final class ConnectState: ObservableObject {
     private func route(_ req: HTTPRequest) -> HTTPResponse {
         if req.method == "GET", req.path == "/v1/info" {
             return .json(["name": "PaxxMaker-Connect", "version": Self.version, "host": hostName,
-                          "orca": orcaInstalled, "apps": installedApps.map(\.key),
+                          "orca": orcaInstalled || SnapmakerOrca.cliWorks,
+                          // Profile sources, the one chosen on the computer first.
+                          "apps": installedApps.map(\.key),
+                          "app_names": Dictionary(uniqueKeysWithValues: installedApps.map { ($0.key, $0.displayName) }),
+                          "slicers": Dictionary(uniqueKeysWithValues: installedApps.compactMap { a in
+                              SlicerEngine.forApp(a.key).map { (a.key, "\($0.name) \($0.version)") } }),
                           // What this version can do beyond the basics — the app checks it.
-                          "features": ["fuzzy", "ranges"]])
+                          // stats/repair/mix need OrcaSlicer 2.5 (--export-statistics,
+                          // --repair, mixed filament slots), so they depend on the source.
+                          "features": SlicerEngine.forApp(OrcaApp.defaultKey)?.features ?? ["fuzzy", "ranges", "filament_ids"],
+                          "features_by_app": Dictionary(uniqueKeysWithValues: installedApps.map { a in
+                              (a.key, SlicerEngine.forApp(a.key)?.features ?? ["fuzzy", "ranges", "filament_ids"]) })])
         }
         guard req.headers["x-paxx-token"] == token else { return .json(["error": "token"], status: 401) }
 
         if req.method == "GET", req.path == "/v1/profiles" {
-            guard let app = OrcaApp.named(req.query["app"] ?? "orca") else { return .json(["error": "app"], status: 404) }
+            guard let app = OrcaApp.named(req.query["app"] ?? OrcaApp.defaultKey) else { return .json(["error": "app"], status: 404) }
             let idx = ProfileIndex(app: app)
             let av = idx.available()
             var out: JSONObject = [:]
@@ -180,6 +199,18 @@ final class ConnectState: ObservableObject {
                     var d: JSONObject = ["name": p.name, "origin": p.origin, "inherits": p.inherits,
                                          "compatible_printers": p.compatible ?? NSNull()]
                     if kind == "machine" { for (k, v) in idx.machineInfo(p.name) { d[k] = v } }
+                    // What a filament is, through its whole chain: the app matches
+                    // the spool loaded in a head by these (OrcaSlicer's filament_id
+                    // names the product, shared by all its variants).
+                    if kind == "filament", let r = idx.resolve(kind: kind, name: p.name) {
+                        func first(_ k: String) -> String? {
+                            if let a = r.dict[k] as? [String] { return a.first }
+                            return r.dict[k] as? String
+                        }
+                        for k in ["filament_id", "filament_vendor", "filament_type", "filament_colour"] {
+                            if let v = first(k), !v.isEmpty { d[k] = v }
+                        }
+                    }
                     return d
                 }
             }
@@ -188,7 +219,7 @@ final class ConnectState: ObservableObject {
         // One preset flattened through its inheritance chain — the app shows
         // its values as the starting point of the quick settings.
         if req.method == "GET", req.path == "/v1/profile" {
-            guard let app = OrcaApp.named(req.query["app"] ?? "orca") else { return .json(["error": "app"], status: 404) }
+            guard let app = OrcaApp.named(req.query["app"] ?? OrcaApp.defaultKey) else { return .json(["error": "app"], status: 404) }
             let kind = req.query["kind"] ?? "process"
             guard ProfileIndex.kinds.contains(kind), let name = req.query["name"],
                   let r = ProfileIndex(app: app).resolve(kind: kind, name: name) else { return .json(["error": "preset"], status: 404) }
@@ -205,9 +236,10 @@ final class ConnectState: ObservableObject {
         if req.method == "POST", req.path == "/v1/jobs" {
             guard let spec = try? JSONSerialization.jsonObject(with: req.body) as? JSONObject else { return .json(["error": "json"], status: 400) }
             let job = SliceJob(spec: spec, jobsDir: jobsDir)
-            lock.lock(); jobs.insert(job, at: 0); if jobs.count > 20 { jobs.removeLast(jobs.count - 20) }; lock.unlock()
+            lock.lock(); jobStore.insert(job, at: 0); if jobStore.count > 20 { jobStore.removeLast(jobStore.count - 20) }
+            let snapshot = jobStore; lock.unlock()
             append("Job \(job.id): \(spec["process"] ?? "") " + L("auf", "on") + " \(spec["machine"] ?? "")")
-            DispatchQueue.main.async { self.objectWillChange.send() }
+            DispatchQueue.main.async { self.jobs = snapshot }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
                 self.runner.run(job) { self.append($0) }
@@ -219,7 +251,7 @@ final class ConnectState: ObservableObject {
             let rest = req.path.dropFirst("/v1/jobs/".count)
             let parts = rest.split(separator: "/")
             guard let idPart = parts.first else { return .json(["error": "job"], status: 404) }
-            lock.lock(); let job = jobs.first { $0.id == idPart }; lock.unlock()
+            lock.lock(); let job = jobStore.first { $0.id == idPart }; lock.unlock()
             guard let job else { return .json(["error": "job"], status: 404) }
             if parts.count == 2, parts[1] == "gcode" {
                 guard job.state == "done", let name = job.result?["gcode"] as? String,
@@ -349,13 +381,36 @@ struct ConnectMenu: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 4) {
-                Label(state.orcaInstalled ? "OrcaSlicer \(state.orcaVersion ?? "") " + L("gefunden", "found") : L("OrcaSlicer fehlt — bitte installieren (Snapmaker Orca allein reicht nicht)", "OrcaSlicer missing — please install it (Snapmaker Orca alone is not enough)"),
-                      systemImage: state.orcaInstalled ? "checkmark.circle.fill" : "xmark.circle.fill")
-                    .foregroundStyle(state.orcaInstalled ? .green : .red)
+                if state.orcaInstalled {
+                    Label("OrcaSlicer \(state.orcaVersion ?? "") " + L("gefunden", "found"), systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else if SnapmakerOrca.cliWorks {
+                    Label(L("OrcaSlicer fehlt — es slict nur Snapmaker Orca (Statistik, Reparatur und Farbmischung brauchen OrcaSlicer 2.5)",
+                            "OrcaSlicer missing — only Snapmaker Orca slices (statistics, repair and colour mixing need OrcaSlicer 2.5)"),
+                          systemImage: "exclamationmark.circle.fill")
+                        .foregroundStyle(.orange)
+                } else {
+                    Label(L("Kein Slicer gefunden — bitte OrcaSlicer installieren", "No slicer found — please install OrcaSlicer"), systemImage: "xmark.circle.fill")
+                        .foregroundStyle(.red)
+                }
                 let apps = state.installedApps
-                Label(apps.isEmpty ? L("Keine Orca-Profile gefunden", "No Orca profiles found") : L("Profile aus: ", "Profiles from: ") + apps.map { $0.key == "snapmaker_orca" ? "Snapmaker Orca" : "OrcaSlicer" }.joined(separator: ", "),
-                      systemImage: apps.isEmpty ? "xmark.circle.fill" : "checkmark.circle.fill")
-                    .foregroundStyle(apps.isEmpty ? .red : .green)
+                if apps.isEmpty {
+                    Label(L("Keine Orca-Profile gefunden", "No Orca profiles found"), systemImage: "xmark.circle.fill")
+                        .foregroundStyle(.red)
+                } else if apps.count == 1 {
+                    Label(L("Profile aus: ", "Profiles from: ") + apps[0].displayName, systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else {
+                    // Same choice as the Linux version's installer question.
+                    Picker(L("Profile aus", "Profiles from"), selection: Binding(get: { state.profileSource }, set: { state.profileSource = $0 })) {
+                        ForEach(apps, id: \.key) { Text($0.displayName).tag($0.key) }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                if let e = SlicerEngine.forApp(state.profileSource) {
+                    Label(L("Slicen mit ", "Slicing with ") + "\(e.name) \(e.version)", systemImage: "gearshape.2")
+                        .foregroundStyle(.secondary)
+                }
             }
             .font(.caption)
 
