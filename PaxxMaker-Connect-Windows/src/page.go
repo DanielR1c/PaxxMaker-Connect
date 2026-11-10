@@ -13,7 +13,9 @@ func pageHTML() string {
 		"scan":      L("QR-Code mit der iPhone-Kamera scannen – PaxxMaker koppelt sich dann von selbst. Oder in PaxxMaker unter Slicer › Manuell verbinden die Adresse und den Code eingeben.", "Scan the QR code with the iPhone camera – PaxxMaker pairs by itself. Or enter the address and the code in PaxxMaker under Slicer › Connect manually."),
 		"address":   L("Adresse", "Address"),
 		"orcaOK":    L("OrcaSlicer gefunden", "OrcaSlicer found"),
-		"orcaMiss":  L("OrcaSlicer fehlt – bitte installieren (Snapmaker Orca allein reicht nicht)", "OrcaSlicer missing – please install it (Snapmaker Orca alone is not enough)"),
+		"orcaMiss":  L("Kein Slicer gefunden – bitte OrcaSlicer installieren", "No slicer found – please install OrcaSlicer"),
+		"snapOnly":  L("OrcaSlicer fehlt – es slict nur Snapmaker Orca (Statistik, Reparatur und Farbmischung brauchen OrcaSlicer 2.5)", "OrcaSlicer missing – only Snapmaker Orca slices (statistics, repair and colour mixing need OrcaSlicer 2.5)"),
+		"slicing":   L("Slicen mit", "Slicing with"),
 		"profiles":  L("Profile aus", "Profiles from"),
 		"noProf":    L("Keine Orca-Profile gefunden", "No Orca profiles found"),
 		"jobs":      L("Letzte Aufträge", "Recent jobs"),
@@ -37,7 +39,9 @@ h1{font-size:20px;margin:0 0 2px}.sub{color:var(--muted);font-size:13px}
 .pair img{width:180px;height:180px;border-radius:8px;background:#fff;padding:6px}
 .code{font:700 34px/1 ui-monospace,Menlo,Consolas,monospace;letter-spacing:3px;margin:6px 0 10px;user-select:all}
 .muted{color:var(--muted);font-size:13px}.row{display:flex;align-items:center;gap:8px;margin:4px 0}
-.dot{width:10px;height:10px;border-radius:50%;flex:none}.ok{background:var(--ok)}.bad{background:var(--bad)}
+.dot{width:10px;height:10px;border-radius:50%;flex:none}.ok{background:var(--ok)}.bad{background:var(--bad)}.warn{background:#ff9f0a}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.seg button{border:0;border-radius:0;padding:5px 12px}.seg button.on{background:var(--accent);color:#fff}
 .jobs div{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-top:1px solid var(--line);font-size:14px}
 .jobs div:first-child{border-top:0}.err{color:var(--bad)}
 label{display:flex;align-items:center;gap:10px;cursor:pointer}
@@ -52,14 +56,15 @@ pre{font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;color:var(--muted);white
 <div class="muted">{{address}}: <span id="addr"></span></div>
 <p class="muted" style="margin:10px 0 0">{{scan}}</p></div></div></div>
 <div class="card"><div class="row"><span class="dot" id="orcaDot"></span><span id="orca"></span></div>
-<div class="row"><span class="dot" id="profDot"></span><span id="prof"></span></div></div>
+<div class="row"><span class="dot" id="profDot"></span><span id="prof"></span><span class="seg" id="seg" style="display:none"></span></div>
+<div class="row muted" id="slicerRow"></div></div>
 <div class="card" id="jobsCard" style="display:none"><div class="muted" style="margin-bottom:6px">{{jobs}}</div><div class="jobs" id="jobs"></div></div>
 <div class="card"><label><input type="checkbox" id="auto"> {{autostart}}</label>
 <div style="margin-top:12px"><button class="q" id="quit">{{quit}}</button></div></div>
 <div class="card"><div class="muted" style="margin-bottom:6px">{{log}}</div><pre id="log"></pre></div>
 </div>
 <script>
-const T={orcaOK:{{orcaOK}},orcaMiss:{{orcaMiss}},profiles:{{profiles}},noProf:{{noProf}},quitDone:{{quitDone}}};
+const T={orcaOK:{{orcaOK}},orcaMiss:{{orcaMiss}},snapOnly:{{snapOnly}},slicing:{{slicing}},profiles:{{profiles}},noProf:{{noProf}},quitDone:{{quitDone}}};
 let quitting=false;
 async function refresh(){
   if(quitting)return;
@@ -68,10 +73,23 @@ async function refresh(){
     document.getElementById('ver').textContent=s.version;
     document.getElementById('token').textContent=s.token;
     document.getElementById('addr').textContent=s.ip+':'+s.port+' ('+s.host+')';
-    document.getElementById('orca').textContent=s.orca?T.orcaOK:T.orcaMiss;
-    document.getElementById('orcaDot').className='dot '+(s.orca?'ok':'bad');
-    document.getElementById('prof').textContent=s.apps.length?T.profiles+': '+s.apps.join(', '):T.noProf;
+    document.getElementById('orca').textContent=s.orca?T.orcaOK:(s.snapmaker?T.snapOnly:T.orcaMiss);
+    document.getElementById('orcaDot').className='dot '+(s.orca?'ok':(s.snapmaker?'warn':'bad'));
+    // Profiles from: one source as text, two as a switch (saved on this PC).
+    const seg=document.getElementById('seg');
+    if(s.apps.length>1){
+      document.getElementById('prof').textContent=T.profiles+':';
+      seg.style.display='';seg.innerHTML='';
+      for(const a of s.apps){const b=document.createElement('button');b.textContent=a.name;
+        if(a.key===s.source)b.className='on';
+        b.onclick=async()=>{await fetch('/ui/source',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'key='+encodeURIComponent(a.key)});refresh();};
+        seg.appendChild(b);}
+    }else{
+      seg.style.display='none';
+      document.getElementById('prof').textContent=s.apps.length?T.profiles+': '+s.apps[0].name:T.noProf;
+    }
     document.getElementById('profDot').className='dot '+(s.apps.length?'ok':'bad');
+    document.getElementById('slicerRow').textContent=s.slicer?T.slicing+' '+s.slicer:'';
     document.getElementById('auto').checked=!!s.autostart;
     const jc=document.getElementById('jobsCard'),jl=document.getElementById('jobs');
     if(s.jobs.length){jc.style.display='';jl.innerHTML='';
@@ -102,7 +120,7 @@ refresh();setInterval(refresh,4000);
 	for k, v := range t {
 		if strings.Contains(html, "{{"+k+"}}") {
 			// JS string literals for the few used inside <script>.
-			if k == "orcaOK" || k == "orcaMiss" || k == "profiles" || k == "noProf" || k == "quitDone" {
+			if k == "orcaOK" || k == "orcaMiss" || k == "snapOnly" || k == "slicing" || k == "profiles" || k == "noProf" || k == "quitDone" {
 				html = strings.ReplaceAll(html, "{{"+k+"}}", jsString(v))
 			} else {
 				html = strings.ReplaceAll(html, "{{"+k+"}}", htmlEscape(v))

@@ -28,7 +28,7 @@ import (
 
 const (
 	appName = "PaxxMaker-Connect"
-	version = "1.4"
+	version = "1.5"
 )
 
 var listenPort = 8765
@@ -53,7 +53,13 @@ func main() {
 	loginItem := flag.String("login-item", "", "on|off: start with Windows (registry Run key)")
 	uninstall := flag.Bool("uninstall", false, "remove the login item and quit")
 	port := flag.Int("port", 8765, "TCP port of the service")
+	slicer := flag.String("slicer", "", "orca|snapmaker_orca: where the profiles come from (saved; also on the status page)")
 	flag.Parse()
+	if *slicer == "orca" || *slicer == "snapmaker_orca" {
+		if dir, err := stateDir(); err == nil && os.MkdirAll(dir, 0o755) == nil {
+			_ = os.WriteFile(filepath.Join(dir, "slicer"), []byte(*slicer+"\n"), 0o644)
+		}
+	}
 	listenPort = *port
 
 	if *loginItem != "" {
@@ -102,14 +108,21 @@ func main() {
 	runTray() // blocks; on non-Windows builds it just waits forever
 }
 
+func stateDir() (string, error) {
+	if dir := os.Getenv("PAXX_STATE_DIR"); dir != "" {
+		return dir, nil
+	}
+	base, err := os.UserConfigDir() // Windows: %AppData%
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, appName), nil
+}
+
 func newState() (*ConnectState, error) {
-	dir := os.Getenv("PAXX_STATE_DIR")
-	if dir == "" {
-		base, err := os.UserConfigDir() // Windows: %AppData%
-		if err != nil {
-			return nil, err
-		}
-		dir = filepath.Join(base, appName)
+	dir, err := stateDir()
+	if err != nil {
+		return nil, err
 	}
 	jobs := filepath.Join(dir, "jobs")
 	models := filepath.Join(dir, "models")

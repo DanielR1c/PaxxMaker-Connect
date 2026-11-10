@@ -28,15 +28,69 @@ type OrcaApp struct {
 
 var profileKinds = []string{"machine", "process", "filament"}
 
-// Only OrcaSlicer. Reading Snapmaker Orca's folder as well split the presets
-// over two sources: a Snapmaker printer pulled its profiles from there, so the
-// filaments saved in OrcaSlicer were missing. OrcaSlicer ships the Snapmaker
-// profiles too, so one source is enough.
+// Two profile sources, one chosen on this PC (the status page's "Profiles
+// from", like the Linux version's --slicer): OrcaSlicer, or Snapmaker Orca.
+// One source at a time — reading both at once split the presets (a Snapmaker
+// printer took its profiles from one folder, the filaments saved in the other
+// were missing). The other app's system profiles only fill in parents.
 func allOrcaApps() []OrcaApp {
 	base := orcaDataBase()
 	return []OrcaApp{
 		{Key: "orca", DataDir: filepath.Join(base, "OrcaSlicer"), ConfName: "OrcaSlicer.conf"},
+		{Key: "snapmaker_orca", DataDir: filepath.Join(base, "Snapmaker_Orca"), ConfName: "Snapmaker_Orca.conf"},
 	}
+}
+
+func (a OrcaApp) DisplayName() string {
+	if a.Key == "snapmaker_orca" {
+		return "Snapmaker Orca"
+	}
+	return "OrcaSlicer"
+}
+
+// The source used when the phone does not name one: PAXX_APP, else the choice
+// saved in the state folder ("slicer", as the Linux version), else OrcaSlicer.
+func defaultAppKey() string {
+	apps := installedOrcaApps()
+	want := os.Getenv("PAXX_APP")
+	if want == "" && state != nil {
+		if b, err := os.ReadFile(filepath.Join(state.StateDir, "slicer")); err == nil {
+			want = strings.TrimSpace(string(b))
+		}
+	}
+	if want == "" {
+		want = "orca"
+	}
+	for _, a := range apps {
+		if a.Key == want {
+			return want
+		}
+	}
+	if len(apps) > 0 {
+		return apps[0].Key
+	}
+	return "orca"
+}
+
+func setDefaultAppKey(key string) error {
+	if state == nil {
+		return os.ErrInvalid
+	}
+	return os.WriteFile(filepath.Join(state.StateDir, "slicer"), []byte(key+"\n"), 0o644)
+}
+
+// Installed sources, the chosen one first (the app takes the first).
+func orderedOrcaApps() []OrcaApp {
+	def := defaultAppKey()
+	var first, rest []OrcaApp
+	for _, a := range installedOrcaApps() {
+		if a.Key == def {
+			first = append(first, a)
+		} else {
+			rest = append(rest, a)
+		}
+	}
+	return append(first, rest...)
 }
 
 func installedOrcaApps() []OrcaApp {
@@ -61,23 +115,35 @@ func orcaAppNamed(key string) (OrcaApp, bool) {
 type presetEntry struct {
 	dict   JSONObject
 	origin string // "user" / "system"
+	// User presets: their parent's setting_id from Orca's .info file, and the
+	// vendor that parent belongs to (set in linkUserVendors).
+	baseID string
+	vendor string
 }
 
 type ProfileIndex struct {
 	App    OrcaApp
 	byName map[string]map[string]presetEntry // kind → name → entry
+	// System presets by vendor as well: kind → name → vendor → dict. Vendors
+	// reuse names for different presets (Creality and OrcaFilamentLibrary both
+	// define "fdm_filament_pla", with different values) — a parent is looked up
+	// at its child's vendor first, as Orca does.
+	system       map[string]map[string]map[string]JSONObject
+	bundleLoaded bool
 }
 
 func NewProfileIndex(app OrcaApp) *ProfileIndex {
-	idx := &ProfileIndex{App: app, byName: map[string]map[string]presetEntry{}}
+	idx := &ProfileIndex{App: app, byName: map[string]map[string]presetEntry{},
+		system: map[string]map[string]map[string]JSONObject{}}
 	for _, k := range profileKinds {
 		idx.byName[k] = map[string]presetEntry{}
+		idx.system[k] = map[string]map[string]JSONObject{}
 	}
 	idx.scan()
 	return idx
 }
 
-func (idx *ProfileIndex) add(kind, path, origin string) {
+func (idx *ProfileIndex) add(kind, path, origin, vendor string) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -90,8 +156,143 @@ func (idx *ProfileIndex) add(kind, path, origin string) {
 	if name == "" {
 		name = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	}
+	if origin == "system" {
+		idx.addSystem(kind, name, obj, vendor)
+	}
+	e := presetEntry{dict: obj, origin: origin}
+	if origin == "user" {
+		e.baseID = infoBaseID(path)
+	}
 	if _, dup := idx.byName[kind][name]; !dup {
-		idx.byName[kind][name] = presetEntry{dict: obj, origin: origin}
+		idx.byName[kind][name] = e
+	}
+}
+
+// The base_id line of the .info file Orca keeps next to a user preset: the
+// setting_id of the system preset it inherits from.
+func infoBaseID(path string) string {
+	info, err := os.ReadFile(strings.TrimSuffix(path, filepath.Ext(path)) + ".info")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(info), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == "base_id" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// Names repeat across vendors ("Generic PETG" is in BBL and in Snapmaker),
+// so a user preset's parent is the system preset with its name AND the
+// setting_id its .info names — the way Orca links them. Without that a U1
+// filament could resolve to Bambu's preset and be hidden as Bambu-only.
+// (Thanks to Megarushing, PR #3.)
+func (idx *ProfileIndex) linkUserVendors() {
+	for kind, m := range idx.byName {
+		for name, e := range m {
+			if e.origin != "user" || e.baseID == "" {
+				continue
+			}
+			parent, _ := e.dict["inherits"].(string)
+			all := idx.system[kind][parent]
+			vendors := make([]string, 0, len(all))
+			for v := range all {
+				vendors = append(vendors, v)
+			}
+			sort.Strings(vendors)
+			for _, v := range vendors {
+				if id, _ := all[v]["setting_id"].(string); id == e.baseID {
+					e.vendor = v
+					m[name] = e
+					break
+				}
+			}
+		}
+	}
+}
+
+func (idx *ProfileIndex) addSystem(kind, name string, obj JSONObject, vendor string) {
+	m := idx.system[kind][name]
+	if m == nil {
+		m = map[string]JSONObject{}
+		idx.system[kind][name] = m
+	}
+	if _, ok := m[vendor]; !ok {
+		m[vendor] = obj
+	}
+}
+
+// A system preset for `name`, preferring the given vendor, then Orca's own
+// filament library, then any vendor (in a fixed order).
+func (idx *ProfileIndex) systemEntry(kind, name, vendor string) (JSONObject, string, bool) {
+	all := idx.system[kind][name]
+	if len(all) == 0 {
+		return nil, "", false
+	}
+	if vendor != "" {
+		if d, ok := all[vendor]; ok {
+			return d, vendor, true
+		}
+	}
+	if d, ok := all["OrcaFilamentLibrary"]; ok {
+		return d, "OrcaFilamentLibrary", true
+	}
+	keys := make([]string, 0, len(all))
+	for k := range all {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return all[keys[0]], keys[0], true
+}
+
+// The presets of one OrcaSlicer 2.5 cache file (<vendor>.opc), as their JSON
+// would read.
+func (idx *ProfileIndex) addCache(path string) {
+	entries := readOPC(path)
+	vendor := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	for _, e := range entries {
+		obj := e.Values
+		obj["name"] = e.Name
+		obj["from"] = "system"
+		if e.Inherits != "" {
+			obj["inherits"] = e.Inherits
+		}
+		if len(e.Includes) > 0 {
+			inc := make([]any, len(e.Includes))
+			for i, s := range e.Includes {
+				inc[i] = s
+			}
+			obj["include"] = inc
+		}
+		if e.Instantiation != "" {
+			obj["instantiation"] = e.Instantiation
+		}
+		if e.SettingID != "" {
+			obj["setting_id"] = e.SettingID
+		}
+		if e.FilamentID != "" {
+			obj["filament_id"] = e.FilamentID
+		}
+		if idx.byName[e.Kind] == nil {
+			continue
+		}
+		idx.addSystem(e.Kind, e.Name, obj, vendor)
+		if _, dup := idx.byName[e.Kind][e.Name]; !dup {
+			idx.byName[e.Kind][e.Name] = presetEntry{dict: obj, origin: "system"}
+		}
+	}
+}
+
+// Caches shipped inside OrcaSlicer itself — only read when a chain reaches a
+// vendor the data folder does not carry.
+func (idx *ProfileIndex) loadBundleCaches() {
+	if idx.bundleLoaded {
+		return
+	}
+	idx.bundleLoaded = true
+	for _, f := range orcaBundleCaches() {
+		idx.addCache(f)
 	}
 }
 
@@ -114,7 +315,7 @@ func (idx *ProfileIndex) scan() {
 		for _, d := range dirs {
 			for _, kind := range profileKinds {
 				for _, f := range jsonFilesUnder(filepath.Join(userRoot, d.Name(), kind)) {
-					idx.add(kind, f, "user")
+					idx.add(kind, f, "user", "")
 				}
 			}
 		}
@@ -135,13 +336,18 @@ func (idx *ProfileIndex) scan() {
 			continue
 		}
 		for _, v := range vendors {
+			if !v.IsDir() && strings.EqualFold(filepath.Ext(v.Name()), ".opc") {
+				idx.addCache(filepath.Join(sysRoot, v.Name()))
+				continue
+			}
 			for _, kind := range profileKinds {
 				for _, f := range jsonFilesUnder(filepath.Join(sysRoot, v.Name(), kind)) {
-					idx.add(kind, f, "system")
+					idx.add(kind, f, "system", v.Name())
 				}
 			}
 		}
 	}
+	idx.linkUserVendors()
 }
 
 // Orca's own config: which system filaments were ticked, which printers used.
@@ -195,34 +401,65 @@ type Resolved struct {
 // nearest SYSTEM ancestor — the CLI derives the printer's system name
 // from it for its process/printer compatibility check.
 func (idx *ProfileIndex) Resolve(kind, name string) (Resolved, bool) {
-	return idx.resolve(kind, name, 0)
+	return idx.resolve(kind, name, 0, "")
 }
 
-func (idx *ProfileIndex) resolve(kind, name string, depth int) (Resolved, bool) {
+func (idx *ProfileIndex) resolve(kind, name string, depth int, vendor string) (Resolved, bool) {
+	if _, ok := idx.byName[kind][name]; !ok && depth > 0 {
+		idx.loadBundleCaches()
+	}
 	if depth >= 20 {
 		return Resolved{}, false
 	}
-	e, ok := idx.byName[kind][name]
-	if !ok {
+	// A user preset by that name wins at the top; parents are system presets,
+	// taken from the child's vendor where it has one.
+	var d JSONObject
+	var origin, myVendor string
+	if e, ok := idx.byName[kind][name]; ok && depth == 0 && e.origin == "user" {
+		d, origin, myVendor = e.dict, e.origin, e.vendor
+	} else if sd, v, ok := idx.systemEntry(kind, name, vendor); ok {
+		d, origin, myVendor = sd, "system", v
+	} else if e, ok := idx.byName[kind][name]; ok {
+		d, origin, myVendor = e.dict, e.origin, e.vendor
+	} else {
 		return Resolved{}, false
+	}
+	parentVendor := myVendor
+	if parentVendor == "" {
+		parentVendor = vendor
 	}
 	out := JSONObject{}
 	missing := ""
-	if parent, _ := e.dict["inherits"].(string); parent != "" {
-		if base, ok := idx.resolve(kind, parent, depth+1); ok {
+	if parent, _ := d["inherits"].(string); parent != "" {
+		if base, ok := idx.resolve(kind, parent, depth+1, parentVendor); ok {
 			out = base.Dict
 			missing = base.MissingParent
 		} else {
 			missing = parent
 		}
 	}
-	for k, v := range e.dict {
-		if k != "inherits" {
+	// Presets an OrcaSlicer 2.5 profile includes lie under its own values.
+	for _, inc := range toStringSlice(d["include"]) {
+		if i, ok := idx.resolve(kind, inc, depth+1, parentVendor); ok {
+			for k, v := range i.Dict {
+				switch k {
+				case "name", "inherits", "from", "instantiation", "setting_id", "filament_id", "include", "type":
+					continue
+				}
+				out[k] = v
+			}
+		}
+	}
+	for k, v := range d {
+		if k != "inherits" && k != "include" {
 			out[k] = v
 		}
 	}
 	out["name"] = name
-	if e.origin == "system" {
+	// The preset kind — system JSONs carried it, the 2.5 caches do not, and
+	// the CLI refuses a file without it.
+	out["type"] = kind
+	if origin == "system" {
 		out["from"] = "system"
 	} else {
 		out["from"] = "User"
@@ -260,23 +497,41 @@ type Preset struct {
 
 // `compatible_printers` as Orca sees it: the preset's own value, else the
 // nearest ancestor's (user presets store only their diff).
+// Once a user preset's vendor is known, the chain stays inside it.
 func (idx *ProfileIndex) effectiveCompatible(kind, name string) []string {
-	cur := name
+	e, ok := idx.byName[kind][name]
+	if !ok {
+		return nil
+	}
+	d, vendor := e.dict, e.vendor
 	for i := 0; i < 20; i++ {
-		e, ok := idx.byName[kind][cur]
-		if !ok {
-			return nil
-		}
-		if c, ok := e.dict["compatible_printers"]; ok {
+		if c, ok := d["compatible_printers"]; ok {
 			if _, isList := c.([]any); isList {
 				return toStringSlice(c)
 			}
 		}
-		p, _ := e.dict["inherits"].(string)
+		p, _ := d["inherits"].(string)
 		if p == "" {
 			return nil
 		}
-		cur = p
+		if pe, ok := idx.byName[kind][p]; ok && pe.origin == "user" {
+			d = pe.dict
+			if pe.vendor != "" {
+				vendor = pe.vendor
+			}
+			continue
+		}
+		if vendor != "" {
+			if sd, v, ok := idx.systemEntry(kind, p, vendor); ok {
+				d, vendor = sd, v
+				continue
+			}
+		}
+		pe, ok := idx.byName[kind][p]
+		if !ok {
+			return nil
+		}
+		d = pe.dict
 	}
 	return nil
 }
@@ -436,6 +691,9 @@ func printableArea(m JSONObject) (xs, ys []float64) {
 }
 
 func toStringSlice(v any) []string {
+	if l, ok := v.([]string); ok {
+		return l
+	}
 	list, ok := v.([]any)
 	if !ok {
 		return nil
