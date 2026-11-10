@@ -38,6 +38,7 @@ func serve(port int) error {
 	mux.HandleFunc("/favicon.ico", localOnly(handleFavicon))
 	mux.HandleFunc("/ui/state", localOnly(handleUIState))
 	mux.HandleFunc("/ui/autostart", localOnly(handleAutostart))
+	mux.HandleFunc("/ui/source", localOnly(handleSource))
 	mux.HandleFunc("/ui/show", localOnly(handleShow))
 	mux.HandleFunc("/ui/quit", localOnly(handleQuit))
 	srv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -71,20 +72,24 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, JSONObject{"error": "path"})
 		return
 	}
+	// Profile sources, the one chosen on this PC first.
 	apps := []string{}
-	for _, a := range installedOrcaApps() {
+	names, slicers, byApp := JSONObject{}, JSONObject{}, JSONObject{}
+	for _, a := range orderedOrcaApps() {
 		apps = append(apps, a.Key)
-	}
-	// The default source first — the app may take the first one.
-	def := defaultAppKey()
-	for i, k := range apps {
-		if k == def {
-			apps[0], apps[i] = apps[i], apps[0]
+		names[a.Key] = a.DisplayName()
+		if e, ok := engineFor(a.Key, false); ok {
+			slicers[a.Key] = e.Label()
+			byApp[a.Key] = e.Features()
+		} else {
+			byApp[a.Key] = []string{"fuzzy", "ranges", "filament_ids"}
 		}
 	}
-	writeJSON(w, 200, JSONObject{"name": appName, "version": version, "host": hostName(), "orca": orcaInstalled(), "apps": apps,
+	writeJSON(w, 200, JSONObject{"name": appName, "version": version, "host": hostName(),
+		"orca": orcaInstalled() || snapmakerCLIUsable(), "apps": apps, "app_names": names, "slicers": slicers,
 		// What this version can do beyond the basics — the app checks it.
-		"features": []string{"fuzzy", "ranges"}})
+		// stats/repair/mix need OrcaSlicer 2.5, so they depend on the source.
+		"features": features(), "features_by_app": byApp})
 }
 
 func appFromQuery(r *http.Request) (OrcaApp, bool) {
@@ -116,6 +121,22 @@ func handleProfiles(w http.ResponseWriter, r *http.Request) {
 			if kind == "machine" {
 				for k, v := range idx.MachineInfo(p.Name) {
 					d[k] = v
+				}
+			}
+			// What a filament is, through its whole chain: the app matches the
+			// spool loaded in a head by these (OrcaSlicer's filament_id names
+			// the product, shared by all its variants).
+			if kind == "filament" {
+				if res, ok := idx.Resolve(kind, p.Name); ok {
+					for _, k := range []string{"filament_id", "filament_vendor", "filament_type", "filament_colour"} {
+						v := res.Dict[k]
+						if l := toStringSlice(v); len(l) > 0 {
+							v = l[0]
+						}
+						if s, _ := v.(string); s != "" {
+							d[k] = s
+						}
+					}
 				}
 			}
 			list = append(list, d)
@@ -248,13 +269,13 @@ func handleQR(w http.ResponseWriter, r *http.Request) {
 }
 
 func uiState() JSONObject {
-	apps := []string{}
+	apps := []JSONObject{}
 	for _, a := range installedOrcaApps() {
-		if a.Key == "snapmaker_orca" {
-			apps = append(apps, "Snapmaker Orca")
-		} else {
-			apps = append(apps, "OrcaSlicer")
-		}
+		apps = append(apps, JSONObject{"key": a.Key, "name": a.DisplayName()})
+	}
+	slicer := ""
+	if e, ok := engineFor(defaultAppKey(), false); ok {
+		slicer = e.Label()
 	}
 	jobs := []JSONObject{}
 	for i, j := range state.Jobs.All() {
@@ -266,7 +287,8 @@ func uiState() JSONObject {
 		jobs = append(jobs, d)
 	}
 	return JSONObject{"token": state.Token, "host": hostName(), "ip": reachableHost(), "port": listenPort,
-		"orca": orcaInstalled(), "orca_path": slicerFor(defaultAppKey()), "apps": apps, "autostart": launchAtLogin(),
+		"orca": orcaInstalled(), "orca_path": slicerFor(defaultAppKey()), "snapmaker": snapmakerCLIUsable(),
+		"apps": apps, "source": defaultAppKey(), "slicer": slicer, "autostart": launchAtLogin(),
 		"jobs": jobs, "log": state.Log.Lines(), "version": version, "german": isGerman}
 }
 
@@ -282,6 +304,21 @@ func handleAutostart(w http.ResponseWriter, r *http.Request) {
 		state.Log.Add(L("Autostart: ", "Autostart: ") + err.Error())
 	}
 	writeJSON(w, 200, JSONObject{"autostart": launchAtLogin()})
+}
+
+// The profile source chosen on the status page.
+func handleSource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "post", 405)
+		return
+	}
+	key := r.FormValue("key")
+	if a, ok := orcaAppNamed(key); ok {
+		if err := setDefaultAppKey(key); err == nil {
+			state.Log.Add(L("Profile aus ", "Profiles from ") + a.DisplayName())
+		}
+	}
+	writeJSON(w, 200, JSONObject{"source": defaultAppKey()})
 }
 
 func handleQuit(w http.ResponseWriter, r *http.Request) {
@@ -318,4 +355,14 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(pageHTML()))
+}
+
+// What this version can do beyond the basics — the app checks it. stats,
+// repair and mix need OrcaSlicer 2.5 (--export-statistics, --repair, mixed
+// filament slots).
+func features() []string {
+	if e, ok := engineFor(defaultAppKey(), false); ok {
+		return e.Features()
+	}
+	return []string{"fuzzy", "ranges", "filament_ids"}
 }

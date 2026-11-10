@@ -205,7 +205,18 @@ func overrideFlag(key string, kind overrideKind, v any) string {
 
 func (r *SliceRunner) Run(job *SliceJob, logf func(string)) {
 	job.set(func() { job.State = "running"; job.Stage = "prepare"; job.Progress = 0.05 })
-	err := r.run(job)
+	triedSnapmaker, err := r.run(job, logf, false)
+	// Snapmaker Orca's command line is young (it crashed outright up to 2.4.0
+	// on the Mac): when it fails, OrcaSlicer slices the same profiles instead.
+	if err != nil && triedSnapmaker && orcaInstalled() {
+		msg := err.Error()
+		if len(msg) > 120 {
+			msg = msg[:120]
+		}
+		logf(fmt.Sprintf("Job %s: Snapmaker Orca %s%s%s", job.ID, L("fehlgeschlagen (", "failed ("), msg, L(") — slice mit OrcaSlicer", ") — slicing with OrcaSlicer")))
+		job.set(func() { job.ErrorCode = nil; job.Progress = 0.05; job.Stage = "prepare" })
+		_, err = r.run(job, logf, true)
+	}
 	if err != nil {
 		job.set(func() { job.State = "failed"; job.Error = err.Error(); job.Stage = "failed" })
 		logf(fmt.Sprintf("Job %s %s: %s", job.ID, L("fehlgeschlagen", "failed"), err.Error()))
@@ -214,20 +225,26 @@ func (r *SliceRunner) Run(job *SliceJob, logf func(string)) {
 	logf(fmt.Sprintf("Job %s %s: %v g, %v s", job.ID, L("fertig", "done"), job.Result["filament_g"], job.Result["time_s"]))
 }
 
-func (r *SliceRunner) run(job *SliceJob) error {
+func (r *SliceRunner) run(job *SliceJob, logf func(string), forceOrca bool) (triedSnapmaker bool, err error) {
 	spec := job.Spec
 	appKey, _ := spec["app"].(string)
 	if appKey == "" {
 		appKey = defaultAppKey()
 	}
-	bin := slicerFor(appKey)
-	if bin == "" {
-		return errors.New(L("OrcaSlicer nicht gefunden – bitte OrcaSlicer installieren", "OrcaSlicer not found – please install OrcaSlicer"))
-	}
 	app, ok := orcaAppNamed(appKey)
 	if !ok {
-		return errors.New(L("Orca-Datenordner nicht gefunden", "Orca data folder not found"))
+		return false, errors.New(L("Orca-Datenordner nicht gefunden", "Orca data folder not found"))
 	}
+	engine, ok := engineFor(appKey, forceOrca)
+	if !ok {
+		return false, errors.New(L("OrcaSlicer nicht gefunden – bitte OrcaSlicer installieren", "OrcaSlicer not found – please install OrcaSlicer"))
+	}
+	logf(fmt.Sprintf("Job %s: %s%s, %s%s", job.ID, L("Profile aus ", "profiles from "), app.DisplayName(), L("slicen mit ", "slicing with "), engine.Label()))
+	return engine.Snapmaker, r.slice(job, spec, app, engine)
+}
+
+func (r *SliceRunner) slice(job *SliceJob, spec JSONObject, app OrcaApp, engine slicerEngine) error {
+	bin := engine.Bin
 	idx := NewProfileIndex(app)
 	machineName, _ := spec["machine"].(string)
 	processName, _ := spec["process"].(string)
@@ -313,6 +330,141 @@ func (r *SliceRunner) run(job *SliceJob) error {
 		}
 	}
 
+	// Colour mixing (OrcaSlicer 2.5): one more filament slot that is not a
+	// head of its own but two heads taking turns — layer by layer or in
+	// sub-layers, at a fixed ratio or as a gradient from bottom to top. The
+	// slot needs a filament entry of its own (a copy of its first component)
+	// and the process carries the blend.
+	newOrca := engine.Modern
+	mixSlot := 0                // first mixed slot, 0 = none
+	objectSlot := map[int]int{} // object index → its mixed slot
+	// Several blends (one per mixed object group) become one slot each,
+	// after the physical filaments. "mix" (one blend) still works.
+	var mixSpecs []JSONObject
+	for _, m := range toAnySlice(spec["mixes"]) {
+		if o, ok := m.(JSONObject); ok {
+			mixSpecs = append(mixSpecs, o)
+		}
+	}
+	if len(mixSpecs) == 0 {
+		if o, ok := spec["mix"].(JSONObject); ok {
+			mixSpecs = []JSONObject{o}
+		}
+	}
+	if newOrca && len(mixSpecs) > 0 {
+		physical := len(filaments)
+		var comps, ratios, grads, ranges []string
+		sublayer := false
+		for _, mix := range mixSpecs {
+			var c []int
+			for _, v := range toAnySlice(mix["components"]) {
+				if f, ok := numOf(v); ok {
+					c = append(c, int(f))
+				}
+			}
+			valid := len(c) >= 2
+			for _, x := range c {
+				if x < 1 || x > physical {
+					valid = false
+				}
+			}
+			if !valid {
+				continue
+			}
+			slot := Resolved{Dict: JSONObject{}}
+			for k, v := range filaments[c[0]-1].Dict {
+				slot.Dict[k] = v
+			}
+			if col, _ := mix["colour"].(string); len(col) >= 6 {
+				if !strings.HasPrefix(col, "#") {
+					col = "#" + col
+				}
+				slot.Dict["filament_colour"] = []string{col}
+			}
+			filaments = append(filaments, slot)
+			n := len(filaments)
+			if mixSlot == 0 {
+				mixSlot = n
+			}
+			for _, o := range toAnySlice(mix["objects"]) {
+				if f, ok := numOf(o); ok {
+					objectSlot[int(f)] = n
+				}
+			}
+			var r []float64
+			for _, v := range toAnySlice(mix["ratios"]) {
+				if f, ok := numOf(v); ok {
+					r = append(r, f)
+				}
+			}
+			if len(r) != len(c) {
+				r = nil
+				for range c {
+					r = append(r, 1/float64(len(c)))
+				}
+			}
+			sum := 0.0
+			for _, x := range r {
+				sum += x
+			}
+			if sum <= 0 {
+				sum = 1
+			}
+			var cs, rs []string
+			for i, x := range c {
+				cs = append(cs, strconv.Itoa(x))
+				rs = append(rs, fmt.Sprintf("%.4f", r[i]/sum))
+			}
+			comps = append(comps, strings.Join(cs, ","))
+			ratios = append(ratios, strings.Join(rs, ","))
+			gradient, _ := mix["gradient"].(bool)
+			rng := ""
+			if gradient {
+				lo, hi := 0.1, 0.9
+				if rl := toAnySlice(mix["range"]); len(rl) == 2 {
+					lo, _ = numOf(rl[0])
+					hi, _ = numOf(rl[1])
+				}
+				rng = fmt.Sprintf("%.2f,%.2f", lo, hi)
+				grads = append(grads, "1")
+			} else {
+				grads = append(grads, "0")
+			}
+			ranges = append(ranges, rng)
+			// OrcaSlicer 2.5 applies a gradient only in sub-layer mode; alternating
+			// whole layers it falls back to the fixed ratio (50/50) — tested.
+			if sub, _ := mix["sublayer"].(bool); sub || gradient {
+				sublayer = true
+			}
+		}
+		if m := len(comps); m > 0 {
+			list := func(mixed []string, others string) []string {
+				out := make([]string, 0, physical+m)
+				for i := 0; i < physical; i++ {
+					out = append(out, others)
+				}
+				return append(out, mixed...)
+			}
+			rep := func(v string) []string {
+				out := make([]string, m)
+				for i := range out {
+					out[i] = v
+				}
+				return out
+			}
+			process.Dict["filament_is_mixed"] = list(rep("1"), "0")
+			process.Dict["filament_mixed_components"] = list(comps, "")
+			process.Dict["filament_mixed_sublayer_ratios"] = list(ratios, "")
+			process.Dict["filament_mixed_gradient"] = list(grads, "0")
+			process.Dict["filament_mixed_gradient_range"] = list(ranges, "")
+			process.Dict["filament_mixed_gradient_curve"] = list(rep(""), "")
+			process.Dict["filament_mixed_gradient_per_part"] = list(rep("0"), "0")
+			if sublayer {
+				process.Dict["enable_mixed_color_sublayer"] = "1"
+			}
+		}
+	}
+
 	writeJSON := func(obj JSONObject, name string) (string, error) {
 		p := filepath.Join(job.Dir, name)
 		b, err := json.Marshal(obj)
@@ -325,7 +477,7 @@ func (r *SliceRunner) run(job *SliceJob) error {
 	modelPath := filepath.Join(job.Dir, "input.3mf")
 	var objs []ThreeMFObject
 	if list, ok := spec["objects"].([]any); ok {
-		for _, e := range list {
+		for oi, e := range list {
 			o, ok := e.(JSONObject)
 			if !ok {
 				continue
@@ -411,6 +563,9 @@ func (r *SliceRunner) run(job *SliceJob) error {
 			if f, ok := numOf(o["extruder"]); ok {
 				ext = int(f)
 			}
+			if slot, ok := objectSlot[oi]; ok {
+				ext = slot
+			}
 			objs = append(objs, ThreeMFObject{Name: name, STL: stl, Transform: transform, Extruder: ext, Paint: paint, Fuzzy: fuzzy, Ranges: ranges, Settings: settings})
 		}
 	}
@@ -441,16 +596,28 @@ func (r *SliceRunner) run(job *SliceJob) error {
 		}
 	}
 
+	// The files are complete already. OrcaSlicer 2.5 would resolve an
+	// `inherits` once more against its own preset bundle — and stops where a
+	// user preset's parent is not in it ("Preset was not found in the loaded
+	// bundle"). Without the field it takes the file as is. Older versions keep
+	// it: their CLI checks process/printer compatibility against the printer's
+	// system name in it.
+	if newOrca {
+		machine.Dict["inherits"] = ""
+		process.Dict["inherits"] = ""
+		for i := range filaments {
+			filaments[i].Dict["inherits"] = ""
+		}
+	}
+	// Snapmaker Orca's CLI crashes on an explicit prime-tower filament (its
+	// normalize_fdm() reads nozzle_diameter from the process config — found
+	// by the Linux version); without it the tower uses "0" (auto).
+	if engine.Snapmaker {
+		delete(process.Dict, "wipe_tower_filament")
+	}
 	machinePath, err := writeJSON(machine.Dict, "machine.json")
 	if err != nil {
 		return err
-	}
-	// Snapmaker Orca's CLI (2.4.0) crashes on an explicit prime-tower
-	// filament: its normalize_fdm() reads nozzle_diameter from the process
-	// config. Without the key the tower uses the default, "0" (auto).
-	snapmaker := appKey == "snapmaker_orca"
-	if snapmaker {
-		delete(process.Dict, "wipe_tower_filament")
 	}
 	processPath, err := writeJSON(process.Dict, "process.json")
 	if err != nil {
@@ -478,10 +645,25 @@ func (r *SliceRunner) run(job *SliceJob) error {
 		"--arrange", "0", "--slice", "0",
 		"--outputdir", job.Dir, "--debug", "2",
 		"--curr-bed-type=" + bedType}
-	// Snapmaker Orca has no --logfile; it logs to the console instead,
-	// which is caught in the same file below.
-	if !snapmaker {
+	// Snapmaker Orca has no --logfile; its console goes to orca.log below.
+	if !engine.Snapmaker {
 		args = append(args, "--logfile", logPath)
+	}
+	repair, _ := spec["repair"].(bool)
+	if newOrca {
+		// OrcaSlicer 2.5 loads its preset bundle from the data folder, writes
+		// the plate's statistics as JSON (per head: model, tower, flush; per
+		// feature) and, when asked, runs its "Fix Model" repair.
+		// OrcaSlicer's own data folder — its preset bundle, whichever source
+		// the profiles came from.
+		dataDir := app.DataDir
+		if o, ok := orcaAppNamed("orca"); ok {
+			dataDir = o.DataDir
+		}
+		args = append(args, "--datadir", dataDir, "--export-statistics")
+		if repair {
+			args = append([]string{args[0], "--repair"}, args[1:]...)
+		}
 	}
 	if ov, ok := spec["overrides"].(JSONObject); ok {
 		known := map[string]bool{}
@@ -542,89 +724,110 @@ func (r *SliceRunner) run(job *SliceJob) error {
 	_ = os.WriteFile(filepath.Join(job.Dir, "cmd.txt"), []byte(bin+" "+strings.Join(args, " ")), 0o644)
 
 	job.set(func() { job.Stage = "slice"; job.Progress = 0.2 })
-	cmd := exec.Command(bin, args...)
-	cmd.Dir = job.Dir
-	hideConsole(cmd)
-	if snapmaker {
-		if f, err := os.Create(logPath); err == nil {
-			defer f.Close()
-			cmd.Stdout, cmd.Stderr = f, f
-		}
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("OrcaSlicer: %w", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	stages := []struct {
-		marker string
-		v      float64
-	}{{"Slicing", 0.3}, {"Generating perimeters", 0.45}, {"Infilling", 0.6}, {"Generating support", 0.7}, {"Generating G-code", 0.85}, {"export_gcode finished", 0.95}}
-	var waitErr error
-loop:
-	for {
-		select {
-		case waitErr = <-done:
-			break loop
-		case <-time.After(400 * time.Millisecond):
-			if txt := tailOfFile(logPath, 20000); txt != "" {
-				for _, s := range stages {
-					if strings.Contains(txt, s.marker) {
-						job.set(func() {
-							if s.v > job.Progress {
-								job.Progress = s.v
-							}
-						})
-					}
-				}
-			}
-		}
-	}
 	gcode := ""
-	if entries, err := os.ReadDir(job.Dir); err == nil {
-		for _, e := range entries {
-			if strings.EqualFold(filepath.Ext(e.Name()), ".gcode") {
-				gcode = filepath.Join(job.Dir, e.Name())
-				break
+	for attempt := 0; ; attempt++ {
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = job.Dir
+		hideConsole(cmd)
+		if engine.Snapmaker {
+			if f, err := os.Create(logPath); err == nil {
+				defer f.Close()
+				cmd.Stdout, cmd.Stderr = f, f
 			}
 		}
-	}
-	code := 0
-	if waitErr != nil {
-		var ee *exec.ExitError
-		if errors.As(waitErr, &ee) {
-			code = normaliseExit(ee.ExitCode())
-		} else {
-			return fmt.Errorf("OrcaSlicer: %w", waitErr)
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("OrcaSlicer: %w", err)
 		}
-	}
-	if code != 0 || gcode == "" {
-		if code == 0 {
-			code = 1
-		}
-		c := code
-		job.set(func() { job.ErrorCode = &c })
-		msg := fmt.Sprintf("Orca Exit %d", code)
-		if known := exitText(code); known != "" {
-			msg += " – " + known
-		} else if txt := tailOfFile(logPath, 200000); txt != "" {
-			var errs []string
-			for _, line := range strings.Split(txt, "\n") {
-				if strings.Contains(strings.ToLower(line), "error") {
-					if len(line) > 160 {
-						line = line[len(line)-160:]
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		stages := []struct {
+			marker string
+			v      float64
+		}{{"Slicing", 0.3}, {"Generating perimeters", 0.45}, {"Infilling", 0.6}, {"Generating support", 0.7}, {"Generating G-code", 0.85}, {"export_gcode finished", 0.95}}
+		var waitErr error
+	loop:
+		for {
+			select {
+			case waitErr = <-done:
+				break loop
+			case <-time.After(400 * time.Millisecond):
+				if txt := tailOfFile(logPath, 20000); txt != "" {
+					for _, s := range stages {
+						if strings.Contains(txt, s.marker) {
+							job.set(func() {
+								if s.v > job.Progress {
+									job.Progress = s.v
+								}
+							})
+						}
 					}
-					errs = append(errs, line)
 				}
 			}
-			if len(errs) > 3 {
-				errs = errs[len(errs)-3:]
-			}
-			if len(errs) > 0 {
-				msg += ": " + strings.Join(errs, " | ")
+		}
+		gcode = ""
+		if entries, err := os.ReadDir(job.Dir); err == nil {
+			for _, e := range entries {
+				if strings.EqualFold(filepath.Ext(e.Name()), ".gcode") {
+					gcode = filepath.Join(job.Dir, e.Name())
+					break
+				}
 			}
 		}
-		return errors.New(msg)
+		code := 0
+		if waitErr != nil {
+			var ee *exec.ExitError
+			if errors.As(waitErr, &ee) {
+				code = normaliseExit(ee.ExitCode())
+			} else {
+				return fmt.Errorf("OrcaSlicer: %w", waitErr)
+			}
+		}
+		if code != 0 || gcode == "" {
+			if code == 0 {
+				code = 1
+			}
+			logText := tailOfFile(logPath, 2000000)
+			// A tower that does not fit (colour mixing makes it ~100 mm deep: a
+			// head change on every layer) is moved towards the front and the
+			// slice repeated — up to three times.
+			if attempt < 3 && strings.Contains(logText, "Prime tower is partially outside") {
+				if moved := moveTowerIn(&process, machine.Dict); moved != "" {
+					if _, err := writeJSON(process.Dict, "process.json"); err == nil {
+						if state != nil {
+							state.Log.Add(fmt.Sprintf("Job %s: %s%s", job.ID, L("Reinigungsturm passt nicht — verschoben nach ", "prime tower does not fit — moved to "), moved))
+						}
+						job.set(func() { job.Progress = 0.2 })
+						continue
+					}
+				}
+			}
+			c := code
+			job.set(func() { job.ErrorCode = &c })
+			msg := fmt.Sprintf("Orca Exit %d", code)
+			if reason := validateReason(logText); reason != "" {
+				msg += " – " + reason
+			} else if known := exitText(code); known != "" {
+				msg += " – " + known
+			} else if txt := logText; txt != "" {
+				var errs []string
+				for _, line := range strings.Split(txt, "\n") {
+					if strings.Contains(strings.ToLower(line), "error") {
+						if len(line) > 160 {
+							line = line[len(line)-160:]
+						}
+						errs = append(errs, line)
+					}
+				}
+				if len(errs) > 3 {
+					errs = errs[len(errs)-3:]
+				}
+				if len(errs) > 0 {
+					msg += ": " + strings.Join(errs, " | ")
+				}
+			}
+			return errors.New(msg)
+		}
+		break
 	}
 	if head > 1 {
 		if err := rewriteTool(gcode, head-1); err != nil {
@@ -633,6 +836,23 @@ loop:
 	}
 	summary := summaryOf(gcode)
 	summary["gcode"] = filepath.Base(gcode)
+	summary["slicer"] = engine.Label()
+	summary["source"] = app.Key
+	statsPath := strings.TrimSuffix(gcode, filepath.Ext(gcode)) + ".statistics.json"
+	if st := statisticsOf(statsPath, head, mixSlot); st != nil {
+		st["changes"] = toolChanges(gcode)
+		summary["stats"] = st
+	}
+	if repair {
+		// Orca logs a failed repair as a warning; a successful one is silent at this level.
+		failed := 0
+		for _, line := range strings.Split(tailOfFile(logPath, 2000000), "\n") {
+			if strings.Contains(line, "repair of") && strings.Contains(line, "failed") {
+				failed++
+			}
+		}
+		summary["repair_failed"] = failed
+	}
 	if fi, err := os.Stat(gcode); err == nil {
 		summary["size"] = fi.Size()
 	} else {
@@ -705,6 +925,80 @@ func plateTempKey(bedType string) string {
 }
 
 // Orca's CLI exit codes that a phone user can actually do something about.
+// Moves the prime tower 50 mm towards the front (and inside on X); "" when
+// it is at the front already.
+func moveTowerIn(process *Resolved, machine JSONObject) string {
+	first := func(k string) (float64, bool) {
+		v := process.Dict[k]
+		if l := toStringSlice(v); len(l) > 0 {
+			v = l[0]
+		}
+		switch x := v.(type) {
+		case string:
+			f, err := strconv.ParseFloat(x, 64)
+			return f, err == nil
+		case float64:
+			return x, true
+		}
+		return 0, false
+	}
+	y, ok1 := first("wipe_tower_y")
+	x, ok2 := first("wipe_tower_x")
+	if !ok1 || !ok2 {
+		return ""
+	}
+	maxX, minY := 270.0, 0.0
+	first2 := true
+	for _, p := range toStringSlice(machine["printable_area"]) {
+		c := strings.Split(p, "x")
+		if len(c) != 2 {
+			continue
+		}
+		px, e1 := strconv.ParseFloat(c[0], 64)
+		py, e2 := strconv.ParseFloat(c[1], 64)
+		if e1 != nil || e2 != nil {
+			continue
+		}
+		if first2 {
+			maxX, minY, first2 = px, py, false
+		}
+		maxX = math.Max(maxX, px)
+		minY = math.Min(minY, py)
+	}
+	w, _ := strconv.ParseFloat(fmt.Sprint(process.Dict["prime_tower_width"]), 64)
+	if w <= 0 {
+		w = 35
+	}
+	b, _ := strconv.ParseFloat(fmt.Sprint(process.Dict["prime_tower_brim_width"]), 64)
+	w += 2 * b
+	if y <= minY+6 {
+		return ""
+	}
+	y = math.Max(minY+5, y-50)
+	x = math.Min(x, maxX-w-5)
+	process.Dict["wipe_tower_x"] = []string{fmt.Sprintf("%.1f", x)}
+	process.Dict["wipe_tower_y"] = []string{fmt.Sprintf("%.1f", y)}
+	return fmt.Sprintf("%.0f / %.0f", x, y)
+}
+
+// OrcaSlicer's own check ("got error when validate: …") in plain words.
+func validateReason(log string) string {
+	i := strings.Index(log, "got error when validate: ")
+	if i < 0 {
+		return ""
+	}
+	line := log[i+len("got error when validate: "):]
+	if j := strings.IndexByte(line, '\n'); j >= 0 {
+		line = line[:j]
+	}
+	line = strings.TrimSpace(line)
+	if strings.Contains(line, "Prime tower is partially outside") {
+		return L("Der Reinigungsturm passt nicht auf das Druckbett — mit Farbmischung wird er sehr tief (ca. 10 cm). Objekte nach hinten schieben, damit vorne Platz ist, oder kleiner drucken.",
+			"The prime tower does not fit on the bed — with colour mixing it gets very deep (about 10 cm). Move the objects back to make room at the front, or print smaller.")
+	}
+	return L("OrcaSlicer-Prüfung: ", "OrcaSlicer check: ") + line
+}
+
 func exitText(code int) string {
 	switch code - 256 {
 	case -101:
@@ -724,6 +1018,8 @@ func exitText(code int) string {
 		return L("Filamente konnten den Köpfen nicht zugeordnet werden.", "Filaments could not be assigned to the heads.")
 	case -67:
 		return L("Nur ein TPU-Filament je Druck möglich.", "Only one TPU filament per print is possible.")
+	case -69:
+		return L("Farbmischung ungültig: Beide Köpfe brauchen dasselbe Material.", "Colour mix invalid: both heads need the same material.")
 	case -62:
 		return L("Filamente mit unterschiedlicher Betttemperatur in einem Druck.", "Filaments with different bed temperatures in one print.")
 	case -14:
@@ -986,4 +1282,95 @@ func summaryOf(path string) JSONObject {
 		out["support"] = sup
 	}
 	return out
+}
+
+func toAnySlice(v any) []any {
+	l, _ := v.([]any)
+	return l
+}
+
+// The part of OrcaSlicer's plate_N.statistics.json the app shows: totals,
+// per head (model / prime tower / flush / support) and per feature. Orca
+// numbers filaments from 1; a one-head slice ran as filament 1 and is
+// reported for the head it was rewritten to.
+func statisticsOf(path string, head, mixSlot int) JSONObject {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var root JSONObject
+	if json.Unmarshal(b, &root) != nil {
+		return nil
+	}
+	sum, ok := root["summary"].(JSONObject)
+	if !ok {
+		return nil
+	}
+	num := func(v any) float64 { f, _ := v.(float64); return f }
+	r2 := func(v float64) float64 { return math.Round(v*100) / 100 }
+	weight := func(v any) float64 { o, _ := v.(JSONObject); return r2(num(o["weight"])) }
+	out := JSONObject{
+		"time_s":    int(math.Round(num(sum["time"]))),
+		"prepare_s": int(math.Round(num(sum["prepare_time"]))),
+		"travel_s":  int(math.Round(num(sum["travel_time"]))),
+		"layers":    int(num(sum["layer_count"])),
+		"weight_g":  r2(num(sum["weight"])),
+		"cost":      r2(num(sum["filament_cost"])),
+		"changes":   int(num(sum["filament_changes"])),
+	}
+	heads := []JSONObject{}
+	for _, e := range toAnySlice(sum["filaments"]) {
+		f, _ := e.(JSONObject)
+		id := int(num(f["id"]))
+		if head > 1 && id == 1 {
+			id = head
+		}
+		heads = append(heads, JSONObject{"head": id, "length_m": r2(num(f["length"]) / 1000),
+			"weight_g": r2(num(f["weight"])), "cost": r2(num(f["cost"])),
+			"model_g": weight(f["model"]), "tower_g": weight(f["prime_tower"]),
+			"flush_g": weight(f["flush"]), "support_g": weight(f["support"])})
+	}
+	out["heads"] = heads
+	feats := []JSONObject{}
+	if fm, ok := sum["features"].(JSONObject); ok {
+		for name, v := range fm {
+			o, _ := v.(JSONObject)
+			feats = append(feats, JSONObject{"name": name, "time_s": int(math.Round(num(o["time"]))), "weight_g": r2(num(o["weight"]))})
+		}
+	}
+	sort.Slice(feats, func(a, b int) bool { return feats[a]["time_s"].(int) > feats[b]["time_s"].(int) })
+	out["features"] = feats
+	if mixSlot > 0 {
+		out["mix_slot"] = mixSlot
+	}
+	return out
+}
+
+// Tool changes in a G-code: lines that are just "Tn", after the first.
+// (Orca's own statistics count only changes within a nozzle.)
+func toolChanges(path string) int {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	n, last := 0, -1
+	for i := 0; i+2 < len(b); {
+		if b[i] == 'T' && (i == 0 || b[i-1] == '\n') {
+			j, v := i+1, 0
+			for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+				v = v*10 + int(b[j]-'0')
+				j++
+			}
+			if j > i+1 && j < len(b) && (b[j] == '\n' || b[j] == '\r') {
+				if last >= 0 && v != last {
+					n++
+				}
+				last = v
+			}
+			i = j
+		} else {
+			i++
+		}
+	}
+	return n
 }

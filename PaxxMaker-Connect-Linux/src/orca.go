@@ -111,3 +111,88 @@ func bundledProfiles(appKey string) string {
 	_ = os.WriteFile(filepath.Join(dir, "stamp"), []byte(stamp), 0o644)
 	return profiles
 }
+
+// Snapmaker Orca's command line slices on Linux (unlike up to 2.4.0 on the
+// Mac). Should it fail, the job falls back to OrcaSlicer (SliceRunner.Run).
+func snapmakerCLIUsable() bool { return snapmakerOrcaBinary() != "" }
+
+// Linux reports no version without starting the program.
+func snapmakerOrcaVersion() string { return "" }
+
+// The program that slices one job: Snapmaker Orca for its own profiles where
+// its command line works, else OrcaSlicer.
+type slicerEngine struct {
+	Bin, Name, Version string
+	Snapmaker          bool
+	// OrcaSlicer 2.5+: .opc caches, CLI resolves inherits, statistics,
+	// repair and colour mixing.
+	Modern bool
+}
+
+func engineFor(appKey string, forceOrca bool) (slicerEngine, bool) {
+	if appKey == "snapmaker_orca" && !forceOrca && snapmakerCLIUsable() {
+		return slicerEngine{Bin: snapmakerOrcaBinary(), Name: "Snapmaker Orca", Version: snapmakerOrcaVersion(), Snapmaker: true}, true
+	}
+	bin := orcaBinary()
+	if bin == "" {
+		return slicerEngine{}, false
+	}
+	return slicerEngine{Bin: bin, Name: "OrcaSlicer", Version: orcaVersion(), Modern: orcaResolvesInherits()}, true
+}
+
+func (e slicerEngine) Label() string { return strings.TrimSpace(e.Name + " " + e.Version) }
+
+func (e slicerEngine) Features() []string {
+	f := []string{"fuzzy", "ranges", "filament_ids"}
+	if e.Modern {
+		f = append(f, "stats", "repair", "mix")
+	}
+	return f
+}
+
+// "2.5+" when OrcaSlicer ships .opc caches, else "".
+func orcaVersion() string {
+	if len(orcaBundleCaches()) > 0 {
+		return "2.5+"
+	}
+	return ""
+}
+
+// The <vendor>.opc preset caches OrcaSlicer 2.5 ships: inside the AppImage
+// (unpacked once, see bundledProfiles), or next to a distro/flatpak binary.
+func orcaBundleCaches() []string {
+	var dirs []string
+	if p := bundledProfiles("orca"); p != "" {
+		dirs = append(dirs, p)
+	}
+	if bin := orcaBinary(); bin != "" {
+		if real, err := filepath.EvalSymlinks(bin); err == nil {
+			bin = real
+		}
+		d := filepath.Dir(bin)
+		dirs = append(dirs, filepath.Join(d, "resources", "profiles"), filepath.Join(d, "..", "share", "OrcaSlicer", "resources", "profiles"),
+			filepath.Join(d, "..", "resources", "profiles"))
+	}
+	dirs = append(dirs, "/usr/share/OrcaSlicer/resources/profiles", "/opt/OrcaSlicer/resources/profiles")
+	for _, d := range dirs {
+		if m, _ := filepath.Glob(filepath.Join(d, "*.opc")); len(m) > 0 {
+			return m
+		}
+	}
+	return nil
+}
+
+// OrcaSlicer 2.5 and later resolve `inherits` themselves against their preset
+// bundle — and refuse a parent they do not know (a user preset). They are the
+// versions that ship .opc caches.
+func orcaResolvesInherits() bool {
+	if len(orcaBundleCaches()) > 0 {
+		return true
+	}
+	for _, a := range installedOrcaApps() {
+		if m, _ := filepath.Glob(filepath.Join(a.DataDir, "system", "*.opc")); len(m) > 0 {
+			return true
+		}
+	}
+	return false
+}
