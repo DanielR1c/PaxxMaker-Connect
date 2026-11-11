@@ -17,7 +17,8 @@ func L(_ de: String, _ en: String) -> String { isGerman ? de : en }
 final class ConnectState: ObservableObject {
     static let shared = ConnectState()
     static let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-    static let port: UInt16 = 8765
+    /// PAXX_PORT: a second instance for development beside the installed one.
+    static let port: UInt16 = UInt16(ProcessInfo.processInfo.environment["PAXX_PORT"] ?? "") ?? 8765
     /// True once the app lives in a Programme folder — only then is "start at
     /// login" stable and the download's DMG can be ejected.
     static let inApplications = Bundle.main.bundlePath.hasPrefix("/Applications/") || Bundle.main.bundlePath.hasPrefix(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path + "/")
@@ -183,7 +184,9 @@ final class ConnectState: ObservableObject {
                           // What this version can do beyond the basics — the app checks it.
                           // stats/repair/mix need OrcaSlicer 2.5 (--export-statistics,
                           // --repair, mixed filament slots), so they depend on the source.
-                          "features": SlicerEngine.forApp(OrcaApp.defaultKey)?.features ?? ["fuzzy", "ranges", "filament_ids"],
+                          "features": (SlicerEngine.forApp(OrcaApp.defaultKey)?.features ?? ["fuzzy", "ranges", "filament_ids"])
+                              // 3MF projects are sliced by Snapmaker Orca, whatever the profile source.
+                              + (SnapmakerOrca.cliWorks ? ["project3mf"] : []),
                           "features_by_app": Dictionary(uniqueKeysWithValues: installedApps.map { a in
                               (a.key, SlicerEngine.forApp(a.key)?.features ?? ["fuzzy", "ranges", "filament_ids"]) })])
         }
@@ -233,6 +236,21 @@ final class ConnectState: ObservableObject {
             try? req.body.write(to: modelsDir.appendingPathComponent(id))
             return .json(["model": id, "bytes": req.body.count])
         }
+        // A finished slicer project (3MF): stored, looked into, and sliced as a
+        // job with `project` in its spec.
+        if req.method == "POST", req.path == "/v1/projects" {
+            guard req.body.count > 100, req.body.prefix(2) == Data([0x50, 0x4B]) else { return .json(["error": "3mf"], status: 400) }
+            let hash = SHA256.hash(data: req.body).map { String(format: "%02x", $0) }.joined().prefix(24)
+            let id = "\(hash).3mf"
+            let url = modelsDir.appendingPathComponent(id)
+            try? req.body.write(to: url)
+            var info = Project3MF.inspect(url)
+            info["project"] = id
+            info["bytes"] = req.body.count
+            info["slicer_ok"] = SnapmakerOrca.cliWorks
+            append(L("3MF-Projekt empfangen: ", "3MF project received: ") + "\(info["printer_model"] ?? "?") · \(info["creator"] ?? "?")")
+            return .json(info)
+        }
         if req.method == "POST", req.path == "/v1/jobs" {
             guard let spec = try? JSONSerialization.jsonObject(with: req.body) as? JSONObject else { return .json(["error": "json"], status: 400) }
             let job = SliceJob(spec: spec, jobsDir: jobsDir)
@@ -242,7 +260,11 @@ final class ConnectState: ObservableObject {
             DispatchQueue.main.async { self.jobs = snapshot }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
-                self.runner.run(job) { self.append($0) }
+                if let pid = spec["project"] as? String {
+                    self.runner.runProject(job, id: pid) { self.append($0) }
+                } else {
+                    self.runner.run(job) { self.append($0) }
+                }
                 DispatchQueue.main.async { self.objectWillChange.send() }
             }
             return .json(job.json, status: 202)

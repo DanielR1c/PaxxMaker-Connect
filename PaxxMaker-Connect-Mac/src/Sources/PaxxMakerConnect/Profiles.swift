@@ -288,6 +288,10 @@ final class ProfileIndex {
             var items: [Preset] = []
             for (name, (d, origin)) in byName[kind] ?? [:] {
                 var ok = origin == "user"
+                // A user preset whose parent is not installed (e.g. one based on a
+                // Creality filament in Snapmaker Orca): Orca does not load it, and
+                // it cannot be sliced — so it is not offered either.
+                if ok, let r = resolve(kind: kind, name: name), r.missingParent != nil { ok = false }
                 if origin == "system" {
                     var sys = (d["instantiation"] as? String ?? "").lowercased() == "true"
                     // Exactly the filaments ticked in Orca's wizard — taking
