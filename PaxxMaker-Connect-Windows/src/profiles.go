@@ -541,8 +541,27 @@ func (idx *ProfileIndex) Available() map[string][]Preset {
 	res := map[string][]Preset{}
 	for _, kind := range profileKinds {
 		var items []Preset
+		// Resolved before the loop: a lookup may load more presets into byName.
+		var users []string
+		for name, e := range idx.byName[kind] {
+			if e.origin == "user" {
+				users = append(users, name)
+			}
+		}
+		broken := map[string]bool{}
+		for _, name := range users {
+			if r, found := idx.Resolve(kind, name); found && r.MissingParent != "" {
+				broken[name] = true
+			}
+		}
 		for name, e := range idx.byName[kind] {
 			ok := e.origin == "user"
+			// A user preset whose parent is not installed (e.g. one based on a
+			// Creality filament in Snapmaker Orca): Orca does not load it, and
+			// it cannot be sliced — so it is not offered either.
+			if ok && broken[name] {
+				ok = false
+			}
 			if e.origin == "system" {
 				inst, _ := e.dict["instantiation"].(string)
 				sys := strings.EqualFold(inst, "true")
